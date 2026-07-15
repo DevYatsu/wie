@@ -82,7 +82,7 @@ large_stack_arrays = "warn"
 needless_pass_by_value = "warn"
 
 [profile.release]
-lto = true                # Link-Time Optimization: глобальная оптимизация между всеми крейтами
-codegen-units = 1         # Сборка в один поток для максимальной LTO-оптимизации кода
-panic = "abort"           # Вырезает тяжелую инфраструктуру раскрутки стека (stack unwinding)
-strip = true              # Полностью вырезает все отладочные символы и таблицы из бинарника
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
