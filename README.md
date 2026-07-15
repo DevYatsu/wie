@@ -59,6 +59,9 @@ cd wie
 cargo build -p wie-cli --release
 ```
 
+![Run smoke](screenshots/screen.jpg)
+_Run smoke_
+
 ### 3. Compile Test Binaries
 
 Build the local x86_64 PE samples using the installed MinGW compiler:

@@ -12,10 +12,14 @@ resolver = "2"
 edition = "2024"
 rust-version = "1.97"
 license = "AGPL-3.0-only"
-authors = ["Vlad"]
-repository = ""
-homepage = ""
+authors = ["Vladislav Kalinkin"]
+repository = "https://github.com/Vladislav-Kalinkin/wie"
 description = "WIE — Windows PE64 userspace emulator (Cranelift JIT + iced)"
+exclude = [
+    "screenshots/",
+    "scripts/",
+    "micro-exes/"
+]
 
 [workspace.dependencies]
 anyhow = "1.0"
