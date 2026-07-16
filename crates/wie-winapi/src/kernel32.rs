@@ -2721,7 +2721,7 @@ pub fn handle_close_handle(
     persist_open_file_to_host(state, handle);
 
     let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
-    state.open_files.retain(|file| file.handle != handle);
+    state.open_files.remove(&handle);
 
     let return_address = engine
         .return_from_win64_api(1)
@@ -2829,19 +2829,16 @@ fn paths_match_guest(requested: &str, candidate: &str) -> bool {
         || guest_basename(&requested_norm) == guest_basename(&candidate_norm)
 }
 
-fn find_open_file_mut(state: &mut WinApiState, handle: u64) -> Option<&mut OpenGuestFile> {
-    state
-        .open_files
-        .iter_mut()
-        .find(|file| file.handle == handle)
+fn find_open_file(state: &WinApiState, handle: u64) -> Option<&OpenGuestFile> {
+    state.open_files.get(&handle)
 }
 
-fn find_open_file(state: &WinApiState, handle: u64) -> Option<&OpenGuestFile> {
-    state.open_files.iter().find(|file| file.handle == handle)
+fn find_open_file_mut(state: &mut WinApiState, handle: u64) -> Option<&mut OpenGuestFile> {
+    state.open_files.get_mut(&handle)
 }
 
 fn is_open_file_handle(state: &WinApiState, handle: u64) -> bool {
-    find_open_file(state, handle).is_some()
+    state.open_files.contains_key(&handle)
 }
 
 /// Opens a guest path using the same resolution rules as `CreateFile*`.
@@ -3078,7 +3075,7 @@ fn allocate_open_file(
         .checked_add(1)
         .context("guest file handle allocator overflow")?;
 
-    state.open_files.push(OpenGuestFile {
+    state.open_files.insert(handle, OpenGuestFile {
         handle,
         path: path.to_owned(),
         bytes,

@@ -27,9 +27,7 @@ pub fn register_open_file(
         return Ok(());
     };
 
-    // Immutable reborrow of state to read size and bytes — engine is a separate
-    // mutable borrow so there is no aliasing conflict.
-    let size = match state.open_files.iter().find(|f| f.handle == handle) {
+    let size = match state.open_files.get(&handle) {
         Some(f) => f.bytes.len(),
         None => return Ok(()),
     };
@@ -53,9 +51,7 @@ pub fn register_open_file(
         return Ok(());
     }
 
-    // Write bytes into guest arena.  Immutable reborrow of state for the file
-    // data; mutable borrow of engine — different allocations, no conflict.
-    if let Some(file) = state.open_files.iter().find(|f| f.handle == handle) {
+    if let Some(file) = state.open_files.get(&handle) {
         engine
             .mem_write(data_va, &file.bytes)
             .context("failed to mirror file bytes into guest I/O arena")?;
@@ -90,7 +86,7 @@ pub fn register_open_file(
 
     state.guest_file_data_next = new_next;
 
-    if let Some(file) = state.open_files.iter_mut().find(|f| f.handle == handle) {
+    if let Some(file) = state.open_files.get_mut(&handle) {
         file.guest_data_va = Some(data_va);
         file.guest_slot_index = Some(u32::try_from(i).unwrap_or(u32::MAX));
     }
@@ -119,7 +115,7 @@ pub fn unregister_open_file(
             break;
         }
     }
-    if let Some(file) = state.open_files.iter_mut().find(|f| f.handle == handle) {
+    if let Some(file) = state.open_files.get_mut(&handle) {
         file.guest_data_va = None;
         file.guest_slot_index = None;
     }
@@ -132,7 +128,7 @@ pub fn sync_slot_from_host(
     state: &WinApiState,
     handle: u64,
 ) -> Result<()> {
-    let Some(file) = state.open_files.iter().find(|f| f.handle == handle) else {
+    let Some(file) = state.open_files.get(&handle) else {
         return Ok(());
     };
     let Some(slot_i) = file.guest_slot_index else {
@@ -179,7 +175,7 @@ pub fn sync_host_cursor_from_guest(
     let Some(cfg) = state.guest_io.clone() else {
         return Ok(());
     };
-    let Some(file) = state.open_files.iter_mut().find(|f| f.handle == handle) else {
+    let Some(file) = state.open_files.get_mut(&handle) else {
         return Ok(());
     };
     let Some(slot_i) = file.guest_slot_index else {

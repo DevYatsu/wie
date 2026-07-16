@@ -1189,8 +1189,7 @@ impl RuntimeSession {
         let file = self
             .winapi_state
             .open_files
-            .iter()
-            .find(|file| file.handle == handle)
+            .get(&handle)
             .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
 
         u64::try_from(file.bytes.len()).context("guest file size does not fit u64")
@@ -1201,8 +1200,7 @@ impl RuntimeSession {
         let file = self
             .winapi_state
             .open_files
-            .iter()
-            .find(|file| file.handle == handle)
+            .get(&handle)
             .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
 
         let end = offset
@@ -1225,9 +1223,9 @@ impl RuntimeSession {
         self.winapi_state
             .open_files
             .iter()
-            .filter_map(|file| {
+            .filter_map(|(&handle, file)| {
                 let size = u64::try_from(file.bytes.len()).ok()?;
-                Some((file.handle, file.path.clone(), size))
+                Some((handle, file.path.clone(), size))
             })
             .collect()
     }

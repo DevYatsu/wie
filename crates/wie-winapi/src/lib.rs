@@ -1,5 +1,6 @@
 //! WinAPI dispatcher model for WIE (generic PE64 userspace).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod advapi32;
@@ -105,8 +106,8 @@ pub struct WinApiState {
     /// Guest-visible virtual files created at runtime (ini/sidecars/temps).
     pub virtual_files: Vec<VirtualGuestFile>,
 
-    /// Currently open guest file handles.
-    pub open_files: Vec<OpenGuestFile>,
+    /// Currently open guest file handles, keyed by handle.
+    pub open_files: HashMap<u64, OpenGuestFile>,
 
     /// Next handle value for `CreateFile*`.
     pub next_file_handle: u64,
