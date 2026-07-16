@@ -1,8 +1,7 @@
 # WIE (_Wie Is Emulator_) - experimental userspace emulator prototype in Rust 1.97
 
-#### WARNING
-
-Work In Progress (WIP): This is an early-stage experimental prototype.
+> [!WARNING]
+> **Work In Progress (WIP):** This is an early-stage experimental prototype.
 
 **Idea** - Create an emulator to run custom 64-bit windows applications on MacOS Apple Silicon
 
