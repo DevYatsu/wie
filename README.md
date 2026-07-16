@@ -19,7 +19,7 @@
 
 At the moment, the project has more than a hundred different plugs made only to build the emulator engine and are not the final solution
 
-## Example of launch
+## Examples of launch
 
 ```
 time ./target/release/wie-cli run micro-exes/out/crt_hello.exe
@@ -29,6 +29,24 @@ api[0] handled fake=0x0000700000000050 ret=0x0000000000000000 resume=0x000000014
 api[1] handled fake=0x00007000000001f0 ret=- resume=- api-ms-win-crt-runtime-l1-1-0.dll!exit
 ./target/release/wie-cli run micro-exes/out/crt_hello.exe  0.02s user 0.03s system 81% cpu 0.059 total
 ```
+```
+time WIE_RUNTIME_PROFILE=1  ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
+run_micro: path=micro-exes/out/long_loop.exe
+cpu_backend: jit
+entry=0x0000000140001000 initial_rsp=0x000000002000eff8
+events=1 termination=ExitProcess { code: 0 }
+  [   0] KERNEL32.dll!ExitProcess handled=true ret=None
+=== WIE_RUNTIME_PROFILE ===
+host_stops=1 noisy=0 charged=1
+emu_ms=1366.56 (100.0%)  handler_ms=0.00 (0.0%)  resolve_ms=0.00 (0.0%)  total_accounted_ms=1366.56
+top exports by handler time:
+        1      0.00 ms  KERNEL32.dll!ExitProcess
+top exports by count:
+        1      0.00 ms  KERNEL32.dll!ExitProcess
+run_micro: ok exit=0
+WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro   1,37s user 0,03s system 99% cpu 1,420 total
+```
+
 
 ## Core Components
 
