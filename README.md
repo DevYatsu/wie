@@ -3,13 +3,17 @@
 > [!WARNING]
 > **Work In Progress (WIP):** This is an early-stage experimental prototype.
 
+> At the moment, WIE cannot run user executable files and is still a research and experimental project
+
+> The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%). At this early stage of running ultra-small executable files, initial optimization attempts have not yet yielded positive results, and the engine lacks proper optimization passes.
+
 **Idea** - Create an emulator to run custom 64-bit windows applications on MacOS Apple Silicon
 
 **Not goals** - Running 32-bit applications, creating a universal emulator of the entire windows history. Only Windows 10 and applications running on it of older versions of the OS
 
 At the moment, the project has more than a hundred different plugs made only to build the emulator engine and are not the final solution
 
-## Example
+## Example of launch
 
 ```
 time ./target/release/wie-cli run micro-exes/out/crt_hello.exe
@@ -134,8 +138,6 @@ At the early stage of building the engine, the project began as an experiment to
 The project had many workarounds for its launch and originally used Unicorn Engine. It was possible to achieve the entire initialization sequence, but later it was decided to delete the data associated with it and start creating its own engine based on iced-x86 and Cranelift.
 
 In one of the tests before removing Lunar Specific elements, it was possible to accelerate the launch by almost 2 seconds compared to Unicorn Engine.
-
-The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%). At this early stage of running ultra-small executable files, initial optimization attempts have not yet yielded positive results, and the engine lacks proper optimization passes.
 
 ## AI-Usage
 
