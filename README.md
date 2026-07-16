@@ -88,6 +88,4 @@ If you find problems, vulnerabilities or optimization solutions that I have not 
 
 ## License
 
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
-
-WIE is open-source software. If you modify this emulator and run it as part of a network service, you **must** make your modified source code available to the users of that service. For more details, see the `LICENSE` file in the repository root.
+This project is licensed under the **GNU Lesser General Public License v3.0 (LGPL-3.0)**.
