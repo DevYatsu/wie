@@ -68,6 +68,10 @@ pub(super) struct JitCtx {
     pub tlb_hot_page: u64,
     /// Host base pointer for [`Self::tlb_hot_page`] (page-aligned guest data).
     pub tlb_hot_ptr: *mut u8,
+    /// Cumulative dirty GPR mask for host writeback (`bit i` → `gpr[i]` changed).
+    /// Hand-written trampolines OR their bits; Cranelift leaves 0 → host syncs all 16.
+    /// Set to `0xffff` before late-bound chain so a subsequent Cranelift block is covered.
+    pub gpr_dirty_bits: u64,
 }
 
 // Byte offsets into [`JitCtx`] used from Cranelift IR (must match `repr(C)`).
@@ -100,11 +104,16 @@ const _: () = {
 pub(super) struct CompiledBlock {
     pub func: unsafe extern "C" fn(*mut JitCtx),
     /// Module function id (for block-chaining `declare_func_in_func`).
-    pub func_id: FuncId,
+    /// `None` for hand-written trampolines (late-bound chain only).
+    pub func_id: Option<FuncId>,
     pub insn_count: u32,
     /// Block touches XMM/SSE state — host must sync the full XMM bank.
     /// Pure GPR blocks skip XMM copy on entry/exit (CPU + cache win).
     pub uses_sse: bool,
+    /// Guest code range covered by this block `[guest_start, guest_end)`.
+    /// Used for range-selective cache invalidation on `mem_write`.
+    pub guest_start: u64,
+    pub guest_end: u64,
 }
 
 /// Hash a guest VA into a chain-table slot.
@@ -417,6 +426,7 @@ pub(super) fn compile_block(
     term: Option<BlockTerm>,
     call_fast: Option<FastApiKind>,
     chain: &HashMap<u64, FuncId>,
+    bytes_len: u32,
 ) -> Result<CompiledBlock, String> {
     let live = analyze_live_gprs(insns);
     let live_xmm = analyze_live_xmm(insns);
@@ -959,11 +969,14 @@ pub(super) fn compile_block(
     let code = eng.module.get_finalized_function(func_id);
     let func = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut JitCtx)>(code) };
 
+    let guest_end = start_rip.saturating_add(u64::from(bytes_len));
     Ok(CompiledBlock {
         func,
-        func_id,
+        func_id: Some(func_id),
         insn_count: u32::try_from(insns.len()).unwrap_or(0),
         uses_sse: has_sse || has_fp,
+        guest_start: start_rip,
+        guest_end,
     })
 }
 

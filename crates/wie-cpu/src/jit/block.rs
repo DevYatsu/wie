@@ -4,7 +4,8 @@ use crate::iced_cpu::IcedCpu;
 use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
 
 /// Max instructions per compiled block (keeps compile time bounded).
-pub(super) const MAX_BLOCK_INSNS: usize = 64;
+/// Raised to capture longer pure loop bodies in one native frame.
+pub(super) const MAX_BLOCK_INSNS: usize = 96;
 /// Min instructions before paying Cranelift compile cost (short blocks lose wall).
 pub(super) const MIN_BLOCK_INSNS: usize = 8;
 
@@ -51,7 +52,7 @@ pub(super) enum BlockKind {
 /// A near `jcc`/`jmp` terminator is **included** and ends the block. Other
 /// non-lowerable insns are **not** included (interpreter runs them next).
 pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
-    let mut insns = Vec::new();
+    let mut insns = Vec::with_capacity(MAX_BLOCK_INSNS);
     let mut rip = start;
     let mut bytes_len = 0_u32;
     let mut term: Option<BlockTerm> = None;
@@ -131,6 +132,25 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
             bytes_len,
             term,
         }
+    }
+}
+
+/// True when a Pure block's terminator is a self-loop back to `start`.
+#[must_use]
+pub(super) fn pure_is_self_loop(kind: &BlockKind, start: u64) -> bool {
+    match kind {
+        BlockKind::Pure {
+            term: Some(BlockTerm::Jmp { target }),
+            ..
+        } => *target == start,
+        BlockKind::Pure {
+            term:
+                Some(BlockTerm::Jcc {
+                    taken, not_taken, ..
+                }),
+            ..
+        } => *taken == start || *not_taken == start,
+        _ => false,
     }
 }
 

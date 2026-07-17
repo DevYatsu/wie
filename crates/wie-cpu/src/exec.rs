@@ -57,7 +57,8 @@ pub(crate) fn step(
         return Ok(StepResult::HostStop { address: rip, size });
     }
 
-    let Ok(bytes) = mem.fetch(rip, 15) else {
+    let mut fetch_buf = [0_u8; 15];
+    let Ok(n) = mem.fetch_into(rip, &mut fetch_buf) else {
         return Ok(StepResult::InvalidMemory(InvalidMem {
             access_type: ACCESS_FETCH,
             address: rip,
@@ -66,7 +67,8 @@ pub(crate) fn step(
         }));
     };
 
-    let mut decoder = iced_x86::Decoder::with_ip(64, &bytes, rip, iced_x86::DecoderOptions::NONE);
+    let mut decoder =
+        iced_x86::Decoder::with_ip(64, &fetch_buf[..n], rip, iced_x86::DecoderOptions::NONE);
     let instr = decoder.decode();
     if instr.is_invalid() || instr.len() == 0 {
         return Err(CpuError::Message(format!(
@@ -92,8 +94,10 @@ pub(crate) fn step(
 }
 
 fn peek_insn_len(mem: &GuestMemory, rip: u64) -> Option<u32> {
-    let bytes = mem.fetch(rip, 15).ok()?;
-    let mut decoder = iced_x86::Decoder::with_ip(64, &bytes, rip, iced_x86::DecoderOptions::NONE);
+    let mut fetch_buf = [0_u8; 15];
+    let n = mem.fetch_into(rip, &mut fetch_buf).ok()?;
+    let mut decoder =
+        iced_x86::Decoder::with_ip(64, &fetch_buf[..n], rip, iced_x86::DecoderOptions::NONE);
     let instr = decoder.decode();
     if instr.is_invalid() || instr.len() == 0 {
         return None;

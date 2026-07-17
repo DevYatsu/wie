@@ -325,20 +325,19 @@ impl GuestMemory {
         if p.is_null() { None } else { Some(p) }
     }
 
-    /// Read up to `max_len` bytes for instruction fetch; fails if first page unmapped.
-    pub(crate) fn fetch(&self, address: u64, max_len: usize) -> Result<Vec<u8>, CpuError> {
-        let mut buf = vec![0_u8; max_len.min(15)];
-        if buf.is_empty() {
-            return Ok(buf);
+    /// Fill `out` (≤15 bytes) from guest `address` for instruction fetch.
+    /// Returns the number of valid bytes written, or an error if nothing is mapped.
+    ///
+    /// Hot path: stack buffer only (no heap) — iced steps this on every insn.
+    pub(crate) fn fetch_into(&self, address: u64, out: &mut [u8]) -> Result<usize, CpuError> {
+        let want = out.len().min(15);
+        if want == 0 {
+            return Ok(0);
         }
-        if self.read(address, &mut buf).is_ok() {
-            return Ok(buf);
-        }
-        let mut len = buf.len();
+        let mut len = want;
         while len > 0 {
-            let mut try_buf = vec![0_u8; len];
-            if self.read(address, &mut try_buf).is_ok() {
-                return Ok(try_buf);
+            if self.read(address, &mut out[..len]).is_ok() {
+                return Ok(len);
             }
             len = len.saturating_sub(1);
         }

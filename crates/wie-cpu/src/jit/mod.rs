@@ -22,6 +22,7 @@
 mod block;
 mod fast_api;
 mod lower;
+mod trampolines;
 
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 
@@ -29,7 +30,7 @@ use crate::exec::{self, StepResult};
 use crate::iced_cpu::IcedCpu;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
-use block::{BlockKind, decode_pure_gpr_block};
+use block::{BlockKind, decode_pure_gpr_block, pure_is_self_loop};
 use fast_api::{
     install_heap_layout, wie_ucrt_fflush, wie_ucrt_free, wie_ucrt_fwrite, wie_ucrt_iob,
     wie_ucrt_malloc, wie_ucrt_memcpy, wie_ucrt_strlen,
@@ -39,6 +40,7 @@ use lower::{
     compile_block, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_load, wie_jit_store,
     wie_jit_string,
 };
+use trampolines::match_micro_stub;
 use std::collections::HashMap;
 
 /// Compile after this many visits to the same guest entry (skip cold code).
@@ -48,6 +50,11 @@ fn hotness_threshold() -> u32 {
     if cfg!(test) { 0 } else { 100 }
 }
 
+/// Known pure self-loops: compile sooner (trade one Cranelift pass vs iced warmup).
+fn pure_loop_hotness() -> u32 {
+    if cfg!(test) { 0 } else { 16 }
+}
+
 /// Hybrid CPU: Cranelift for hot pure-GPR blocks, iced for everything else.
 pub struct JitCpu {
     iced: IcedCpu,
@@ -55,6 +62,9 @@ pub struct JitCpu {
     engine: Option<JitEngine>,
     /// Guest block entry VA → cache entry.
     cache: HashMap<u64, CacheEntry>,
+    /// Ready-block FuncIds for chaining (kept in sync with `cache`; avoids
+    /// rebuilding a full HashMap on every compile).
+    chain_ids: HashMap<u64, cranelift_module::FuncId>,
     stats: JitStats,
     /// Persistent multi-way page TLB across chained blocks (invalidate on mem_write/hooks).
     tlb_page: [u64; TLB_WAYS],
@@ -78,8 +88,9 @@ enum CacheEntry {
     Ready(CompiledBlock),
     /// Do not retry decode/compile at this VA (cold fail or non-pure).
     Never,
-    /// Visit counter before compile attempt.
-    Hot(u32),
+    /// Visit counter + compile threshold (threshold fixed on first sight so we
+    /// do not re-decode for UCRT peek on every warmup visit).
+    Hot { visits: u32, thr: u32 },
 }
 
 struct JitEngine {
@@ -164,6 +175,7 @@ impl JitCpu {
             iced: IcedCpu::open_x86_64(),
             engine,
             cache: HashMap::new(),
+            chain_ids: HashMap::new(),
             stats: JitStats {
                 ..JitStats::default()
             },
@@ -187,8 +199,63 @@ impl JitCpu {
         // New mappings invalidate prior compiles that missed the fast path.
         if !self.cache.is_empty() {
             self.cache.clear();
+            self.chain_ids.clear();
         }
         self.invalidate_chain_and_shadow();
+    }
+
+    /// Insert a Ready block and keep `chain_ids` consistent.
+    fn insert_ready(&mut self, rip: u64, compiled: CompiledBlock) {
+        if let Some(fid) = compiled.func_id {
+            self.chain_ids.insert(rip, fid);
+        }
+        self.cache.insert(rip, CacheEntry::Ready(compiled));
+    }
+
+    /// Drop all compiled blocks (self-modifying code / hook reinstall).
+    fn clear_compiled(&mut self) {
+        self.cache.clear();
+        self.chain_ids.clear();
+    }
+
+    /// Drop only Ready blocks whose guest code range overlaps `[addr, addr+len)`.
+    /// Data writes that miss all compiled ranges leave the cache intact.
+    fn invalidate_compiled_overlapping(&mut self, addr: u64, len: usize) {
+        if self.cache.is_empty() || len == 0 {
+            return;
+        }
+        let write_end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        let to_drop: Vec<u64> = self
+            .cache
+            .iter()
+            .filter_map(|(va, entry)| match entry {
+                CacheEntry::Ready(c)
+                    if ranges_overlap(c.guest_start, c.guest_end, addr, write_end) =>
+                {
+                    Some(*va)
+                }
+                _ => None,
+            })
+            .collect();
+        if to_drop.is_empty() {
+            // Data-only write: page buffers are updated in place; TLB stays valid.
+            return;
+        }
+        for va in &to_drop {
+            self.cache.remove(va);
+            self.chain_ids.remove(va);
+        }
+        // Rebuild late-bound chain from remaining Ready entries.
+        chain_table_clear(self.chain_va.as_mut(), self.chain_fn.as_mut());
+        for (va, entry) in &self.cache {
+            if let CacheEntry::Ready(c) = entry {
+                let fn_ptr = c.func as usize as u64;
+                chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), *va, fn_ptr);
+            }
+        }
+        // Code bytes changed under a previously compiled region — drop shadow.
+        self.shadow_sp = 0;
+        self.shadow_ret = [0; lower::SHADOW_DEPTH];
     }
 
     /// Returns `(result, guest_insns_retired)` for budget accounting.
@@ -210,31 +277,21 @@ impl JitCpu {
             match self.cache.get(&rip) {
                 Some(CacheEntry::Ready(compiled)) => {
                     self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-                    let n = compiled.insn_count;
-                    let func = compiled.func;
-                    let uses_sse = compiled.uses_sse;
-                    return Ok(self.finish_compiled(rip, func, n, uses_sse));
+                    let meta = CompiledRunMeta::from(compiled);
+                    return Ok(self.finish_compiled(rip, meta));
                 }
                 Some(CacheEntry::Never) => {
                     // Fast path: known non-JIT site.
                 }
-                Some(CacheEntry::Hot(n)) => {
-                    let next = n.saturating_add(1);
-                    // UCRT-direct blocks: compile as soon as hotness ≥ 2 (second visit)
-                    // so CRT one-shot calls still benefit after a single warmup interpret.
-                    let thr = if self.peek_fast_ucrt_call(rip) {
-                        2
-                    } else {
-                        hotness_threshold()
-                    };
+                Some(&CacheEntry::Hot { visits, thr }) => {
+                    let next = visits.saturating_add(1);
                     if thr > 0 && next < thr {
-                        self.cache.insert(rip, CacheEntry::Hot(next));
+                        self.cache
+                            .insert(rip, CacheEntry::Hot { visits: next, thr });
                     } else if let Some(compiled) = self.try_compile(rip) {
-                        let n = compiled.insn_count;
-                        let func = compiled.func;
-                        let uses_sse = compiled.uses_sse;
-                        self.cache.insert(rip, CacheEntry::Ready(compiled));
-                        return Ok(self.finish_compiled(rip, func, n, uses_sse));
+                        let meta = CompiledRunMeta::from(&compiled);
+                        self.insert_ready(rip, compiled);
+                        return Ok(self.finish_compiled(rip, meta));
                     } else {
                         self.cache.insert(rip, CacheEntry::Never);
                     }
@@ -242,19 +299,26 @@ impl JitCpu {
                 None => {
                     // Eager when tests (thr=0) OR first sight of a fast-UCRT call site
                     // (host_stop avoidance is worth the compile tax even once).
-                    let eager = hotness_threshold() == 0 || self.peek_fast_ucrt_call(rip);
-                    if eager {
+                    // Pure self-loops use a lower threshold (compile sooner, less iced).
+                    let is_ucrt = self.peek_fast_ucrt_call(rip);
+                    let is_loop = self.peek_self_loop(rip);
+                    let thr = if is_ucrt {
+                        2
+                    } else if is_loop {
+                        pure_loop_hotness()
+                    } else {
+                        hotness_threshold()
+                    };
+                    if thr == 0 || is_ucrt {
                         if let Some(compiled) = self.try_compile(rip) {
-                            let n = compiled.insn_count;
-                            let func = compiled.func;
-                            let uses_sse = compiled.uses_sse;
-                            self.cache.insert(rip, CacheEntry::Ready(compiled));
-                            return Ok(self.finish_compiled(rip, func, n, uses_sse));
+                            let meta = CompiledRunMeta::from(&compiled);
+                            self.insert_ready(rip, compiled);
+                            return Ok(self.finish_compiled(rip, meta));
                         }
                         self.cache.insert(rip, CacheEntry::Never);
                     } else {
                         // First visit: start hotness, interpret (avoid compile on cold code).
-                        self.cache.insert(rip, CacheEntry::Hot(1));
+                        self.cache.insert(rip, CacheEntry::Hot { visits: 1, thr });
                     }
                 }
             }
@@ -283,6 +347,12 @@ impl JitCpu {
         }
     }
 
+    /// True when decode yields a pure self-loop (jcc/jmp back to entry).
+    fn peek_self_loop(&self, rip: u64) -> bool {
+        let kind = decode_pure_gpr_block(&self.iced, rip);
+        pure_is_self_loop(&kind, rip)
+    }
+
     fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
         match decode_pure_gpr_block(&self.iced, rip) {
             BlockKind::Pure {
@@ -291,15 +361,33 @@ impl JitCpu {
                 bytes_len,
                 term,
             } => {
-                // Already-compiled successors for block chaining (FuncId lookup).
-                let chain: HashMap<u64, cranelift_module::FuncId> = self
-                    .cache
-                    .iter()
-                    .filter_map(|(&va, e)| match e {
-                        CacheEntry::Ready(c) => Some((va, c.func_id)),
-                        _ => None,
-                    })
-                    .collect();
+                // 1–3 insn guest stubs: hand-written host trampoline (no Cranelift).
+                if let Some(micro) = match_micro_stub(&insns, term) {
+                    let guest_end = rip.saturating_add(u64::from(bytes_len));
+                    let compiled = CompiledBlock {
+                        func: micro.func(),
+                        func_id: None,
+                        insn_count: micro.insn_count(),
+                        uses_sse: false,
+                        guest_start: rip,
+                        guest_end,
+                    };
+                    self.stats.compiles = self.stats.compiles.saturating_add(1);
+                    let fn_ptr = compiled.func as usize as u64;
+                    chain_table_insert(
+                        self.chain_va.as_mut(),
+                        self.chain_fn.as_mut(),
+                        rip,
+                        fn_ptr,
+                    );
+                    tracing::debug!(
+                        start = format_args!("{rip:#x}"),
+                        insns = compiled.insn_count,
+                        "jit micro-stub trampoline"
+                    );
+                    return Some(compiled);
+                }
+
                 // Resolve import thunks before mutably borrowing the JIT engine.
                 let call_fast = match term {
                     Some(block::BlockTerm::Call { target, .. }) => {
@@ -308,19 +396,33 @@ impl JitCpu {
                     }
                     _ => None,
                 };
-                let eng = self.engine.as_mut()?;
-                match compile_block(eng, rip, &insns, end_rip, term, call_fast, &chain) {
+                // Split borrows: `chain_ids` (Ready FuncIds) + `engine` mutably.
+                // Avoids rebuilding a HashMap over the full cache each compile.
+                let JitCpu {
+                    engine,
+                    chain_ids,
+                    chain_va,
+                    chain_fn,
+                    stats,
+                    ..
+                } = self;
+                let eng = engine.as_mut()?;
+                match compile_block(
+                    eng,
+                    rip,
+                    &insns,
+                    end_rip,
+                    term,
+                    call_fast,
+                    chain_ids,
+                    bytes_len,
+                ) {
                     Ok(compiled) => {
-                        self.stats.compiles = self.stats.compiles.saturating_add(1);
+                        stats.compiles = stats.compiles.saturating_add(1);
                         // Publish into late-bound chain table so older blocks can
                         // `call_indirect` here without recompilation.
                         let fn_ptr = compiled.func as usize as u64;
-                        chain_table_insert(
-                            self.chain_va.as_mut(),
-                            self.chain_fn.as_mut(),
-                            rip,
-                            fn_ptr,
-                        );
+                        chain_table_insert(chain_va.as_mut(), chain_fn.as_mut(), rip, fn_ptr);
                         tracing::debug!(
                             start = format_args!("{rip:#x}"),
                             end = format_args!("{end_rip:#x}"),
@@ -333,7 +435,7 @@ impl JitCpu {
                         Some(compiled)
                     }
                     Err(e) => {
-                        self.stats.compile_skip = self.stats.compile_skip.saturating_add(1);
+                        stats.compile_skip = stats.compile_skip.saturating_add(1);
                         tracing::debug!(start = format_args!("{rip:#x}"), error = %e, "jit lower failed");
                         None
                     }
@@ -346,18 +448,15 @@ impl JitCpu {
         }
     }
 
-    fn finish_compiled(
-        &mut self,
-        entry_rip: u64,
-        func: unsafe extern "C" fn(*mut JitCtx),
-        n: u32,
-        uses_sse: bool,
-    ) -> (StepResult, usize) {
-        if let Some(inv) = self.run_compiled(entry_rip, func, uses_sse) {
+    fn finish_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> (StepResult, usize) {
+        if let Some(inv) = self.run_compiled(entry_rip, meta) {
             (StepResult::InvalidMemory(inv), 0)
         } else {
-            self.stats.jit_insns = self.stats.jit_insns.saturating_add(u64::from(n));
-            (StepResult::Continue, usize::try_from(n).unwrap_or(1))
+            self.stats.jit_insns = self.stats.jit_insns.saturating_add(u64::from(meta.insn_count));
+            (
+                StepResult::Continue,
+                usize::try_from(meta.insn_count).unwrap_or(1),
+            )
         }
     }
 
@@ -365,18 +464,19 @@ impl JitCpu {
     fn run_compiled(
         &mut self,
         entry_rip: u64,
-        func: unsafe extern "C" fn(*mut JitCtx),
-        uses_sse: bool,
+        meta: CompiledRunMeta,
     ) -> Option<exec::InvalidMem> {
         let mem_ptr = std::ptr::from_mut(self.iced.guest_mem_mut());
         let regs = self.iced.regs_mut();
+        // Full GPR snapshot on entry: late-bound chaining reloads live regs from
+        // JitCtx, so every architectural GPR must be valid for successors.
         let mut gpr = [0_u64; 16];
         for (i, slot) in gpr.iter_mut().enumerate() {
             *slot = regs.gpr(i);
         }
         // Pure GPR blocks skip the 16×u128 XMM bank copy on both sides of the call.
         let mut xmm = [0_u64; 32];
-        if uses_sse {
+        if meta.uses_sse {
             for i in 0..16 {
                 let v = regs.xmm_at(i);
                 xmm[i * 2] = v as u64;
@@ -402,10 +502,13 @@ impl JitCpu {
             chain_fn: self.chain_fn.as_mut_ptr(),
             tlb_hot_page: self.tlb_hot_page,
             tlb_hot_ptr: self.tlb_hot_ptr,
+            // 0 = Cranelift path (host falls back to full writeback);
+            // trampolines OR their dirty bits; chain sets 0xffff.
+            gpr_dirty_bits: 0,
         };
-        // SAFETY: `func` was finalized by Cranelift for this process; `ctx` is valid.
+        // SAFETY: `func` is a finalized Cranelift block or hand-written trampoline.
         unsafe {
-            func(std::ptr::from_mut(&mut ctx));
+            (meta.func)(std::ptr::from_mut(&mut ctx));
         }
         // Persist multi-way TLB + sticky hot page + shadow stack across chained blocks.
         self.tlb_page = ctx.tlb_page;
@@ -415,12 +518,34 @@ impl JitCpu {
         self.tlb_hot_ptr = ctx.tlb_hot_ptr;
         self.shadow_sp = ctx.shadow_sp;
         self.shadow_ret = ctx.shadow_ret;
-        for i in 0..16 {
-            if let Some(&v) = ctx.gpr.get(i) {
-                regs.set_gpr(i, v);
+        // Prefer cumulative trampoline dirty bits (partial writeback when a
+        // micro-stub does not chain). Cranelift leaves bits at 0 → full sync
+        // (internal block chaining can dirty arbitrary GPRs).
+        let dirty = if ctx.fault != 0 || ctx.gpr_dirty_bits == 0 {
+            0xffff_u16
+        } else {
+            ctx.gpr_dirty_bits as u16
+        };
+        if dirty == 0xffff {
+            for i in 0..16 {
+                if let Some(&v) = ctx.gpr.get(i) {
+                    regs.set_gpr(i, v);
+                }
+            }
+        } else {
+            let mut m = dirty;
+            let mut i = 0_usize;
+            while m != 0 {
+                if m & 1 != 0
+                    && let Some(&v) = ctx.gpr.get(i)
+                {
+                    regs.set_gpr(i, v);
+                }
+                m >>= 1;
+                i = i.saturating_add(1);
             }
         }
-        if uses_sse {
+        if meta.uses_sse {
             for i in 0..16 {
                 let lo = ctx.xmm[i * 2];
                 let hi = ctx.xmm[i * 2 + 1];
@@ -455,6 +580,30 @@ impl JitCpu {
         self.shadow_sp = 0;
         self.shadow_ret = [0; lower::SHADOW_DEPTH];
     }
+}
+
+/// Snapshot of a Ready block needed to run it without holding a cache borrow.
+#[derive(Clone, Copy)]
+struct CompiledRunMeta {
+    func: unsafe extern "C" fn(*mut JitCtx),
+    insn_count: u32,
+    uses_sse: bool,
+}
+
+impl From<&CompiledBlock> for CompiledRunMeta {
+    fn from(c: &CompiledBlock) -> Self {
+        Self {
+            func: c.func,
+            insn_count: c.insn_count,
+            uses_sse: c.uses_sse,
+        }
+    }
+}
+
+/// Half-open range overlap: `[a0, a1)` vs `[b0, b1)`.
+#[inline]
+fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
+    a0 < b1 && b0 < a1
 }
 
 /// Follow PE import thunks / short jumps to the final callee VA.
@@ -684,12 +833,9 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        // Self-modifying / patched guest code: drop JIT cache (simple, correct).
-        if !self.cache.is_empty() {
-            self.cache.clear();
-        }
-        self.invalidate_tlb();
-        self.invalidate_chain_and_shadow();
+        // Only invalidate compiled blocks whose guest code range overlaps the write.
+        // Data writes (stack/heap/TEB) leave the JIT cache and chain table intact.
+        self.invalidate_compiled_overlapping(address, bytes.len());
         self.iced.mem_write(address, bytes)
     }
 
@@ -703,7 +849,7 @@ impl CpuEngine for JitCpu {
         hook_end: u64,
         stop_bitmap: Vec<u8>,
     ) -> Result<(), CpuError> {
-        self.cache.clear();
+        self.clear_compiled();
         self.invalidate_tlb();
         self.invalidate_chain_and_shadow();
         self.iced
@@ -716,8 +862,21 @@ impl CpuEngine for JitCpu {
     }
 
     fn precompile_at(&mut self, address: u64) {
-        if self.engine.is_some() {
-            let _ = self.try_compile(address);
+        if self.engine.is_none() {
+            return;
+        }
+        // Host-stop slots never run native code (checked before cache lookup).
+        // Skip decode/compile tax for pure stop-bitmap entries.
+        if let Some(hook) = self.iced.hooks_ref()
+            && hook.should_host_stop(address)
+        {
+            return;
+        }
+        if let Some(compiled) = self.try_compile(address) {
+            self.insert_ready(address, compiled);
+        } else {
+            // Remember NotPure so first runtime hit does not re-decode.
+            self.cache.entry(address).or_insert(CacheEntry::Never);
         }
     }
 
@@ -762,10 +921,8 @@ impl CpuEngine for JitCpu {
                 && let Some(CacheEntry::Ready(compiled)) = self.cache.get(&rip)
             {
                 self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-                let n = compiled.insn_count;
-                let func = compiled.func;
-                let uses_sse = compiled.uses_sse;
-                let (result, retired) = self.finish_compiled(rip, func, n, uses_sse);
+                let meta = CompiledRunMeta::from(compiled);
+                let (result, retired) = self.finish_compiled(rip, meta);
                 match result {
                     StepResult::Continue => {
                         executed = executed.saturating_add(retired.max(1));

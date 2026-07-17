@@ -363,10 +363,14 @@ impl RuntimeSession {
             .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap)
             .context("failed to install persistent runtime hooks")?;
 
-        // Pre-compile all known fake-API stubs so they are Ready in the JIT
-        // cache when first hit, avoiding the cold-start compilation tax.
+        // Selective precompile: only in-guest stubs (GetLastError / CS / …).
+        // Precompiling every fake-API VA (including host-stop passthroughs and
+        // rewire jmps) spikes init peak RAM via Cranelift; hot stubs are cheap
+        // (hand-written trampolines or tiny blocks) and hit early.
         for entry in &fake_api_entries {
-            engine.precompile_at(entry.fake_target_va);
+            if entry.traits.guest_stub() {
+                engine.precompile_at(entry.fake_target_va);
+            }
         }
 
         engine
