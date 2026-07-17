@@ -749,6 +749,7 @@ pub fn build_fake_api_lookup(patched: &[PePatchedImport]) -> Vec<PeFakeApiEntry>
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;

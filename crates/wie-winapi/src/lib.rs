@@ -635,19 +635,21 @@ pub use dispatch_table::{
 };
 
 #[cfg(test)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use wie_cpu::{CpuEngine, IcedCpu};
 
     const STACK_VA: u64 = 0x100_0000;
-    const STACK_SIZE: u64 = 0x10000;
-    const STACK_TOP: u64 = STACK_VA + STACK_SIZE - 0x100;
+    const STACK_SIZE: usize = 0x1_0000;
+    // STACK_VA + STACK_SIZE - 0x100 (leave room for a dummy return address).
+    const STACK_TOP: u64 = 0x100_FF00;
 
-    /// Minimal engine for handler unit tests: maps 16 MiB with a valid return address on the stack.
+    /// Minimal engine for handler unit tests: maps guest pages with a valid return address on the stack.
     fn test_engine() -> IcedCpu {
         let mut cpu = IcedCpu::open_x86_64();
-        cpu.mem_map(0x1000, 0x100000, 7).expect("map test memory");
-        cpu.mem_map(STACK_VA, STACK_SIZE as usize, 7)
+        cpu.mem_map(0x1000, 0x10_0000, 7).expect("map test memory");
+        cpu.mem_map(STACK_VA, STACK_SIZE, 7)
             .expect("map test stack");
         // Write a dummy return address — every handler calls return_from_win64_api which reads it.
         cpu.mem_write(STACK_TOP, &0_u64.to_le_bytes())
@@ -785,7 +787,7 @@ mod tests {
         let mut engine = test_engine();
         let mut state = default_winapi_state();
         state.last_error = 123;
-        let r = kernel32::handle_get_last_error(&mut engine, &mut state).expect("GetLastError");
+        let r = kernel32::handle_get_last_error(&mut engine, &state).expect("GetLastError");
         assert_eq!(r.return_value, 123);
     }
 
@@ -807,7 +809,10 @@ mod tests {
         let mut state = default_winapi_state();
         // VK_RETURN = 0x0D, keyboard_state starts all zero.
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
-        assert_return_value!(user32::handle_get_async_key_state(&mut engine, &mut state), 0);
+        assert_return_value!(
+            user32::handle_get_async_key_state(&mut engine, &mut state),
+            0
+        );
     }
 
     #[test]
@@ -816,7 +821,10 @@ mod tests {
         let mut state = default_winapi_state();
         state.keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
         write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
-        assert_return_value!(user32::handle_get_async_key_state(&mut engine, &mut state), 0x81);
+        assert_return_value!(
+            user32::handle_get_async_key_state(&mut engine, &mut state),
+            0x81
+        );
     }
 
     #[test]
@@ -942,13 +950,19 @@ mod tests {
     fn test_set_security_descriptor_dacl_null_fails() {
         let mut engine = test_engine();
         write_regs(&mut engine, 0, 0, 0, 0, 0);
-        assert_return_value!(advapi32::handle_set_security_descriptor_dacl(&mut engine), 0);
+        assert_return_value!(
+            advapi32::handle_set_security_descriptor_dacl(&mut engine),
+            0
+        );
     }
 
     #[test]
     fn test_set_security_descriptor_dacl_valid_succeeds() {
         let mut engine = test_engine();
         write_regs(&mut engine, 0x1000, 1, 0x2000, 1, 0);
-        assert_return_value!(advapi32::handle_set_security_descriptor_dacl(&mut engine), 1);
+        assert_return_value!(
+            advapi32::handle_set_security_descriptor_dacl(&mut engine),
+            1
+        );
     }
 }

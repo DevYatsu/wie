@@ -7,7 +7,6 @@
 #![allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
     clippy::indexing_slicing, // fixed-size PT_SIZE arrays, masked indices
     unsafe_code // page-table raw pointers for Drop + install
 )]
@@ -356,7 +355,7 @@ impl GuestMemory {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
 

@@ -56,8 +56,7 @@ pub fn handle_get_async_key_state(
         .read_rcx()
         .context("failed to read RCX for GetAsyncKeyState")?;
 
-    let virtual_key = usize::try_from(virtual_key_raw & 0xff)
-        .unwrap_or(0);
+    let virtual_key = usize::try_from(virtual_key_raw & 0xff).unwrap_or(0);
 
     // Bit 15: key is currently down.  Bit 0: key was pressed since last call.
     let key_state = state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
@@ -168,7 +167,9 @@ pub fn handle_peek_message_a(
         .read_r9()
         .context("failed to read R9 for PeekMessageA")?;
 
-    let w_remove_msg = engine.read_rsp().ok()
+    let w_remove_msg = engine
+        .read_rsp()
+        .ok()
         .and_then(|rsp| read_guest_u32(engine, rsp.wrapping_add(0x28)).ok())
         .unwrap_or(0);
 
@@ -195,8 +196,12 @@ pub fn handle_peek_message_a(
             // PM_REMOVE: remove from queue.
             state.message_queue.remove(index)
         } else {
-            // PM_NOREMOVE: leave in queue.
-            state.message_queue[index].clone()
+            // PM_NOREMOVE: leave in queue. Index is from `position` on this Vec.
+            state
+                .message_queue
+                .get(index)
+                .cloned()
+                .context("PeekMessageA matching index vanished")?
         };
         write_message_structure(engine, message_address, &queued)?;
         1

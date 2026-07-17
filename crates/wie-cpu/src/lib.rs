@@ -285,7 +285,7 @@ pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
 #[cfg(unix)]
 pub fn process_cpu_times_us() -> (u64, u64) {
     // SAFETY: getrusage(RUSAGE_SELF) with a valid rusage pointer is well-defined.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) != 0 {

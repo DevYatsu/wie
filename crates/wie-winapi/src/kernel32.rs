@@ -3096,15 +3096,18 @@ fn allocate_open_file(
         .checked_add(1)
         .context("guest file handle allocator overflow")?;
 
-    state.open_files.insert(handle, OpenGuestFile {
+    state.open_files.insert(
         handle,
-        path: path.to_owned(),
-        bytes,
-        cursor: 0,
-        host_path,
-        guest_data_va: None,
-        guest_slot_index: None,
-    });
+        OpenGuestFile {
+            handle,
+            path: path.to_owned(),
+            bytes,
+            cursor: 0,
+            host_path,
+            guest_data_va: None,
+            guest_slot_index: None,
+        },
+    );
 
     // Keep legacy single-handle fields in sync when opening the main executable.
     if is_main_module_path(state, path) {
@@ -4149,8 +4152,8 @@ fn handle_tls_free(
 ) -> Result<WinApiHandlerResult> {
     let index_raw = engine.read_rcx()?;
     let index = usize::try_from(index_raw).unwrap_or(usize::MAX);
-    if index < state.tls_slots.len() {
-        state.tls_slots[index] = 0;
+    if let Some(slot) = state.tls_slots.get_mut(index) {
+        *slot = 0;
     }
     state.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
