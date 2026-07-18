@@ -1,6 +1,9 @@
 //! Persistent `RuntimeSession`: guest setup, yield/resume, and API hook loop.
 
-use crate::hooks::{RuntimeFakeApiEntry, build_all_runtime_fake_api_entries, find_fake_api_entry};
+use crate::hooks::{
+    SoftApiTable, build_iat_fake_api_entries, collect_stub_entries, resolve_fake_api_at,
+    resolve_import_fake_va,
+};
 use crate::memory::{
     DEFAULT_LAYOUT, RuntimeMemoryLayout, build_default_environment_strings_w,
     default_winapi_environment, default_winapi_state, write_process_identity_strings,
@@ -268,9 +271,7 @@ fn apply_pe_section_protects(
         .context("PE gap NOACCESS protect")?;
 
     let header_len = u64::from(plan.header_size);
-    if let Some((start, end)) =
-        wie_pe::page_align_image_range(0, header_len, plan.size_of_image)
-    {
+    if let Some((start, end)) = wie_pe::page_align_image_range(0, header_len, plan.size_of_image) {
         let len = usize::try_from(end.saturating_sub(start)).context("header range")?;
         if len > 0 {
             engine
@@ -474,9 +475,8 @@ pub struct RuntimeSession {
     engine: Box<dyn wie_cpu::CpuEngine>,
     environment: wie_winapi::WinApiEnvironment,
     winapi_state: wie_winapi::WinApiState,
-    fake_api_entries: Vec<RuntimeFakeApiEntry>,
-    /// O(1) lookup: fake target VA → index into `fake_api_entries`.
-    fake_api_by_va: HashMap<u64, usize>,
+    /// Soft (non-WinApiId) exports: O(1) index from dense VA payload.
+    soft_apis: SoftApiTable,
     layout: RuntimeMemoryLayout,
     entry_point_va: u64,
     initial_rsp: u64,
@@ -495,8 +495,7 @@ struct SessionInit {
     engine: Box<dyn wie_cpu::CpuEngine>,
     environment: wie_winapi::WinApiEnvironment,
     winapi_state: wie_winapi::WinApiState,
-    fake_api_entries: Vec<RuntimeFakeApiEntry>,
-    fake_api_by_va: HashMap<u64, usize>,
+    soft_apis: SoftApiTable,
     layout: RuntimeMemoryLayout,
     entry_point_va: u64,
     initial_rsp: u64,
@@ -509,8 +508,7 @@ impl RuntimeSession {
             engine: init.engine,
             environment: init.environment,
             winapi_state: init.winapi_state,
-            fake_api_entries: init.fake_api_entries,
-            fake_api_by_va: init.fake_api_by_va,
+            soft_apis: init.soft_apis,
             layout: init.layout,
             entry_point_va: init.entry_point_va,
             initial_rsp: init.initial_rsp,
@@ -583,11 +581,21 @@ impl RuntimeSession {
         options: SessionOptions,
     ) -> Result<Self> {
         let t_init = Instant::now();
+        let mut soft_apis = SoftApiTable::default();
         let (image, image_summary, patched_imports) =
-            wie_pe::build_loaded_image_with_fake_imports(path)?;
+            wie_pe::build_loaded_image_with_fake_imports_with(path, |import| {
+                let name = if import.name.is_empty() {
+                    format!("ORDINAL {}", import.ordinal)
+                } else {
+                    import.name.clone()
+                };
+                let (va, _) =
+                    resolve_import_fake_va(&import.library, &name, import.iat_slot_va, &mut soft_apis)?;
+                Ok(va)
+            })?;
 
-        let (mut fake_api_entries, mut fake_api_by_va) =
-            build_all_runtime_fake_api_entries(&patched_imports)?;
+        let iat_entries = build_iat_fake_api_entries(&patched_imports);
+        let fake_api_entries = collect_stub_entries(&iat_entries, &soft_apis);
 
         // WIE CPU backend (Unicorn default; `WIE_CPU=iced` for interpreter).
         let mut engine = crate::open_default_cpu().context("failed to open WIE CPU backend")?;
@@ -606,8 +614,8 @@ impl RuntimeSession {
             .mem_write(image_summary.image_base, &image)
             .context("failed to write PE image into guest memory")?;
 
-        let pe_map_plan = wie_pe::pe_map_plan_from_file(path)
-            .context("failed to build PE section map plan")?;
+        let pe_map_plan =
+            wie_pe::pe_map_plan_from_file(path).context("failed to build PE section map plan")?;
         apply_pe_section_protects(engine.as_mut(), &pe_map_plan)
             .context("failed to apply PE section protects")?;
 
@@ -690,15 +698,12 @@ impl RuntimeSession {
             layout.fake_api_size,
             &stub_cfg,
             layout.guest_io_code_base + 0x600,
-            layout
-                .guest_io_code_size
-                .saturating_sub(0x600),
+            layout.guest_io_code_size.saturating_sub(0x600),
         )?;
 
         let guest_io_config = crate::guest_io::install_guest_io(
             &mut engine,
-            &mut fake_api_entries,
-            &mut fake_api_by_va,
+            &fake_api_entries,
             &mut stop_bitmap,
             &layout,
         )?;
@@ -720,8 +725,7 @@ impl RuntimeSession {
 
         let guest_heap_cfg = crate::guest_heap_accel::install_guest_heap_accel(
             &mut engine,
-            &mut fake_api_entries,
-            &mut fake_api_by_va,
+            &fake_api_entries,
             &mut stop_bitmap,
             &layout,
         )?;
@@ -735,18 +739,18 @@ impl RuntimeSession {
             .context("failed to map guest MultiByteToWideChar code")?;
         let _guest_mbwc = crate::guest_mbwc::install_guest_mbwc(
             &mut engine,
-            &mut fake_api_entries,
-            &mut fake_api_by_va,
+            &fake_api_entries,
             &mut stop_bitmap,
             &layout,
         )?;
 
         // JIT: direct UCRT imports (malloc/memcpy/strlen/…) + guest heap layout.
+        // Dense: small VA→kind table from soft/IAT names (no runtime HashMap probe on stop).
         {
-            let mut by_va = std::collections::HashMap::new();
+            let mut pairs = Vec::new();
             for entry in &fake_api_entries {
                 if let Some(kind) = wie_cpu::FastApiKind::from_export_name(&entry.name) {
-                    by_va.insert(entry.fake_target_va, kind);
+                    pairs.push((entry.fake_target_va, kind));
                 }
             }
             let heap_end = layout
@@ -758,7 +762,7 @@ impl RuntimeSession {
                     base: layout.process_heap_base,
                     end: heap_end,
                 },
-                by_va,
+                pairs,
             });
         }
 
@@ -875,8 +879,7 @@ impl RuntimeSession {
             .checked_add(0x800)
             .context("entry module file name W pointer overflow")?;
 
-        let process =
-            wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
+        let process = wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
         write_process_identity_strings(
             &mut engine,
             command_line_a_ptr,
@@ -980,8 +983,7 @@ impl RuntimeSession {
             engine,
             environment,
             winapi_state,
-            fake_api_entries,
-            fake_api_by_va,
+            soft_apis,
             layout,
             entry_point_va: image_summary.entry_point_va,
             initial_rsp,
@@ -1303,9 +1305,7 @@ impl RuntimeSession {
             }
 
             let resolve_t0 = self.profile_enabled.then(Instant::now);
-            let Some(resolved) =
-                find_fake_api_entry(&self.fake_api_entries, &self.fake_api_by_va, hook.address)
-            else {
+            let Some(resolved) = resolve_fake_api_at(hook.address, &self.soft_apis) else {
                 termination = EntryTraceTermination::RuntimeStop(format!(
                     "unresolved fake API at {:#018x}",
                     hook.address,

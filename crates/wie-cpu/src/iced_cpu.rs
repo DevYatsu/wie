@@ -158,12 +158,7 @@ impl CpuEngine for IcedCpu {
         self.mem.virtual_alloc(addr, size, alloc_type, protect)
     }
 
-    fn virtual_free(
-        &mut self,
-        addr: u64,
-        size: usize,
-        free_type: u32,
-    ) -> Result<(), CpuError> {
+    fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
         self.mem.virtual_free(addr, size, free_type)
     }
 

@@ -106,10 +106,7 @@ pub fn build_windows_command_line(argv0: &str, extra_args: &[String]) -> String 
 /// Quote one command-line argument for Windows CreateProcess-style cmdline.
 #[must_use]
 pub fn quote_windows_arg(arg: &str) -> String {
-    let needs_quotes = arg.is_empty()
-        || arg
-            .chars()
-            .any(|c| c == ' ' || c == '\t' || c == '"');
+    let needs_quotes = arg.is_empty() || arg.chars().any(|c| c == ' ' || c == '\t' || c == '"');
     if !needs_quotes {
         return arg.to_owned();
     }
@@ -350,12 +347,10 @@ pub fn page_align_image_range(rva: u64, len: u64, size_of_image: u64) -> Option<
     }
     let end = (rva.saturating_add(len)).min(size_of_image);
     let start = rva / PAGE * PAGE;
-    let end_aligned = end.div_ceil(PAGE).saturating_mul(PAGE).min(
-        size_of_image
-            .div_ceil(PAGE)
-            .saturating_mul(PAGE)
-            .max(end),
-    );
+    let end_aligned = end
+        .div_ceil(PAGE)
+        .saturating_mul(PAGE)
+        .min(size_of_image.div_ceil(PAGE).saturating_mul(PAGE).max(end));
     // Clamp end to size_of_image rounded up to page within image mapping.
     let img_end = size_of_image.div_ceil(PAGE).saturating_mul(PAGE);
     let end_aligned = end_aligned.min(img_end);
@@ -444,25 +439,6 @@ pub struct PePatchedImport {
 
     /// Fake API target virtual address written into the `IAT` slot.
     pub fake_target_va: u64,
-}
-
-/// Fake API lookup entry used by the runtime dispatcher.
-#[derive(Debug, Clone, Serialize)]
-pub struct PeFakeApiEntry {
-    /// Fake API target virtual address.
-    pub fake_target_va: u64,
-
-    /// Imported library name.
-    pub library: String,
-
-    /// Imported function name, or an `ORDINAL` label.
-    pub name: String,
-
-    /// Runtime `IAT` slot virtual address.
-    pub iat_slot_va: u64,
-
-    /// Runtime `IAT` slot relative virtual address.
-    pub iat_slot_rva: u64,
 }
 
 /// Reads and inspects a `PE` image from disk.
@@ -865,36 +841,37 @@ fn copy_section(
     Ok(())
 }
 
-/// Builds a loaded image and patches `IAT` slots with fake API addresses.
-pub fn build_loaded_image_with_fake_imports(
+/// Builds a loaded image and patches `IAT` slots with caller-provided fake VAs.
+///
+/// `fake_target` maps each import to a dense-encoded fake API address (see
+/// `wie_winapi::fake_va`). The resolver is invoked once per IAT slot.
+pub fn build_loaded_image_with_fake_imports_with<F>(
     path: &Path,
-) -> Result<(Vec<u8>, PeLoadedImageSummary, Vec<PePatchedImport>)> {
+    mut fake_target: F,
+) -> Result<(Vec<u8>, PeLoadedImageSummary, Vec<PePatchedImport>)>
+where
+    F: FnMut(&PeImportSummary) -> Result<u64>,
+{
     let (mut image, summary) = build_loaded_image(path)?;
     let imports = inspect_pe_imports(path)?;
-    let patched = patch_loaded_image_imports(&mut image, &imports)?;
+    let patched = patch_loaded_image_imports_with(&mut image, &imports, &mut fake_target)?;
 
     Ok((image, summary, patched))
 }
 
-/// Patches `IAT` slots in an already loaded image.
-pub fn patch_loaded_image_imports(
+/// Patches `IAT` slots using a dense fake-VA resolver.
+pub fn patch_loaded_image_imports_with<F>(
     image: &mut [u8],
     imports: &[PeImportSummary],
-) -> Result<Vec<PePatchedImport>> {
-    const FAKE_API_BASE: u64 = 0x0000_7000_0000_0000;
-    const FAKE_API_STRIDE: u64 = 0x10;
-
+    mut fake_target: F,
+) -> Result<Vec<PePatchedImport>>
+where
+    F: FnMut(&PeImportSummary) -> Result<u64>,
+{
     let mut patched = Vec::with_capacity(imports.len());
 
-    for (index, import) in imports.iter().enumerate() {
-        let index_u64 = u64::try_from(index).context("import index does not fit u64")?;
-        let fake_target_va = FAKE_API_BASE
-            .checked_add(
-                index_u64
-                    .checked_mul(FAKE_API_STRIDE)
-                    .context("fake API index multiplication overflow")?,
-            )
-            .context("fake API address overflow")?;
+    for import in imports {
+        let fake_target_va = fake_target(import)?;
 
         let slot_offset =
             usize::try_from(import.iat_slot_rva).context("IAT slot RVA does not fit usize")?;
@@ -925,21 +902,6 @@ pub fn patch_loaded_image_imports(
     }
 
     Ok(patched)
-}
-
-/// Converts patched imports into fake API dispatcher lookup entries.
-#[must_use]
-pub fn build_fake_api_lookup(patched: &[PePatchedImport]) -> Vec<PeFakeApiEntry> {
-    patched
-        .iter()
-        .map(|import| PeFakeApiEntry {
-            fake_target_va: import.fake_target_va,
-            library: import.library.clone(),
-            name: import.name.clone(),
-            iat_slot_va: import.iat_slot_va,
-            iat_slot_rva: import.iat_slot_rva,
-        })
-        .collect()
 }
 
 #[cfg(test)]

@@ -13,11 +13,11 @@
 
 **Idea** — Emulate custom **64-bit Windows** user-mode binaries on **macOS Apple Silicon**.
 
-**Not goals** — 32-bit apps; full historical Windows compatibility; Wine-style identity mapping (`mmap(addr = guest_va)`). Focus is Windows 10-era PE64 + the APIs real tools actually call. Guest VA always soft-translates through region tables / radix / TLB.
+**Not goals** — 32-bit apps; full historical Windows compatibility; Wine-style identity mapping (`mmap(addr = guest_va)`). Focus is Windows 10-era PE64 + the APIs real tools actually call. Guest VA always soft-translates through region tables / arenas / TLB.
 
 The WinAPI surface is intentionally incomplete: many handlers are stubs sufficient for the micro-suite and engine bring-up, not a final product surface.
 
-**Status (post Phases 0–7):** Soft-translate guest memory defaulting to pure **mmap** arenas (`hybrid` / `hash` still available), software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky + set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, expanded in-guest stubs, host idle park (`WIE_IDLE`), invalidation stress + `FlushInstructionCache`, and a short [`docs/RUNBOOK.md`](docs/RUNBOOK.md). See [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
+**Status (post great cleanup):** Soft-translate guest memory is **mmap-only** (no hash/hybrid fallback). Software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky + set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, expanded in-guest stubs, host idle park (`WIE_IDLE`), invalidation stress + `FlushInstructionCache`. CLI compressed to `inspect` / `run` / `trace`. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
 ## Examples of launch
 
@@ -26,38 +26,36 @@ The WinAPI surface is intentionally incomplete: many handlers are stubs sufficie
 cargo build -p wie-cli --release
 
 # Tiny freestanding PE
-time ./target/release/wie-cli run-micro micro-exes/out/crt_hello.exe
+time ./target/release/wie-cli run micro-exes/out/crt_hello.exe
 # hello from crt
 # run_micro: ok exit=0
 
 # Heap API matrix
-time ./target/release/wie-cli run-micro micro-exes/out/winapi_heap.exe
+time ./target/release/wie-cli run micro-exes/out/winapi_heap.exe
 # HeapAlloc / HeapSize / HeapReAlloc / HeapFree / double-free / size-0 paths
 # run_micro: ok exit=0
 
 # ~100M stack-volatile loop under Cranelift JIT (block-wide super path)
-time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
+time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run micro-exes/out/long_loop.exe
 # expect ~0.28–0.32s wall, ~100% CPU, mem_backend=mmap
 
 # Interactive argv + live stdin (blocks on host Read until Enter / pipe data)
-time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/cli_args.exe -- -n 3 -m hi -i
+time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run micro-exes/out/cli_args.exe -- -n 3 -m hi -i
 
 # Deterministic stdin (no TTY) — same as the suite uses
-printf 'CLI_IN\n' | ./target/release/wie-cli run-micro micro-exes/out/cli_args.exe --stdin /dev/stdin -- -n 3 -m hi -i
+printf 'CLI_IN\n' | ./target/release/wie-cli run micro-exes/out/cli_args.exe --stdin /dev/stdin -- -n 3 -m hi -i
 
 # Bottle files (guest C:\… → {root}/drive_c/…)
 BOTTLE=$(mktemp -d)
 mkdir -p "$BOTTLE/drive_c/App"
-./target/release/wie-cli run-micro micro-exes/out/write_file.exe --root "$BOTTLE"
+./target/release/wie-cli run micro-exes/out/write_file.exe --root "$BOTTLE"
 ```
 
 ```bash
 # Full clean-room gate (builds micros + runs all PE gates under WIE_CPU=jit)
 make -C micro-exes && ./scripts/run-micro-suite.sh
 
-# Backend / JIT A/B
-WIE_MEM=hash  ./scripts/run-micro-suite.sh
-WIE_MEM=mmap  ./scripts/run-micro-suite.sh
+# JIT / CPU A/B
 WIE_CPU=iced  ./scripts/run-micro-suite.sh          # interpreter only (long_loop may hit slice limit)
 WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh       # helper-only loads/stores
 WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh       # sticky + heap pin IR
@@ -69,15 +67,15 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 
 | Crate             | Role                                                                                                                                                                                                                             |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`wie-cpu`**     | CPU + guest memory: **`JitCpu`** (default) — Cranelift x86-64→ARM64 block JIT + iced fallback; **`IcedCpu`** — pure iced-x86 (`WIE_CPU=iced`). Memory: hybrid/mmap/hash backends, RegionTable, PageMap/VAD/SPC, JIT TLB + pins.  |
+| **`wie-cpu`**     | CPU + guest memory: **`JitCpu`** (default) — Cranelift x86-64→ARM64 block JIT + iced fallback; **`IcedCpu`** — pure iced-x86 (`WIE_CPU=iced`). Memory: **mmap arenas only**, RegionTable, PageMap/VAD/SPC, JIT TLB + pins.      |
 | **`wie-winapi`**  | KERNEL32 / UCRT / USER32 / GDI32 / … handlers. Dense `WinApiId` dispatch (no string compares on the hot path). Guest heap: 24 size classes + bump + optional shared control block. Real `VirtualAlloc`/`Free`/`Protect`/`Query`. |
 | **`wie-runtime`** | Session: PE load, layout regions, fake-API hooks, guest accelerators (stubs / heap / I/O / MBWC), run loop, TEB last-error, bottles (`WIE_ROOT`). Profile via `WIE_RUNTIME_PROFILE`.                                             |
 | **`wie-pe`**      | PE64 parse, section map plan, import/IAT patch with fake VAs, COFF → `PAGE_*` protects.                                                                                                                                          |
-| **`wie-cli`**     | `inspect` / `sections` / `imports` / `image` / `winapi-map` / `run-micro` / `run` / `entry-trace`.                                                                                                                               |
+| **`wie-cli`**     | Three fundamentals: `inspect` / `run` / `trace` (aliases `run-micro`, `entry-trace` kept).                                                                                                                                       |
 
 ## Execution Flow
 
-1. **PE loading** — `wie-pe` maps the image into one `MEM_IMAGE` arena (or HashMap pages under `WIE_MEM=hash`), rewrites every IAT slot to a **fake API VA** (e.g. `0x7000_0000_0000_xxxx`), then applies section protects from COFF characteristics (software permission checks always; optional host `mprotect` on arenas).
+1. **PE loading** — `wie-pe` maps the image into one `MEM_IMAGE` arena, rewrites every IAT slot to a **fake API VA** (e.g. `0x7000_0000_0000_xxxx`), then applies section protects from COFF characteristics (software permission checks always; optional host `mprotect` on arenas).
 
 2. **Hooks + guest stubs** — A **stop bitmap** covers the fake range. Hot APIs (`GetLastError` / `SetLastError`, critical sections, PID/TID, cmdline, metrics/colors, …) get small **in-guest stubs** so they never host-stop. Optional accelerators rewire IAT entries to real guest machine code (`WIE_GUEST_HEAP`, `WIE_GUEST_IO`, `WIE_GUEST_MBWC`).
 
@@ -105,8 +103,8 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 
 ## Memory & Heap
 
-- **Backends** (`WIE_MEM`): default **`mmap`** (every map → anonymous arena); force `hybrid` (≥ 64 KiB arenas + sparse tiny pages) or `hash` (legacy sparse only). Soft translate only — guest VA ≠ host VA.
-- **Layout**: `RegionTable` names stack / heap / image / fake API / TEB / stubs; arena-backed regions expose `host_base` for JIT pins.
+- **Storage**: sole path is **mmap arenas** (every map → anonymous demand-zero arena). Soft translate only — guest VA ≠ host VA. Legacy `hash` / `hybrid` backends removed.
+- **Layout**: `RegionTable` names stack / heap / image / fake API / TEB / stubs; arenas expose `host_base` for JIT pins.
 - **Permissions**: software PageMap + VAD (Free / Reserved / Committed, `PAGE_*`); SPC on every read/write/fetch and JIT TLB install. Optional dual `mprotect` on arena frames (`WIE_MPROTECT`, default on) — never the sole oracle under 4K guest / 16K host clinch.
 - **Dynamic mapping**: real `VirtualAlloc` / `VirtualFree` / `VirtualProtect` / `VirtualQuery` (64 KiB reserve granularity, 4 KiB commit).
 - **Process heap**: segregated freelists (**24** size classes, up to 64 KiB) + bump for virgin space; 8-byte size header before each payload.
@@ -118,7 +116,6 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 | Variable                                | Effect                                                                                                |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `WIE_CPU=jit` \| `iced`                 | CPU backend (default **jit**)                                                                         |
-| `WIE_MEM=mmap` \| `hybrid` \| `hash`    | Guest storage (default **mmap**, Phase 7) — see [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md) |
 | `WIE_MPROTECT=0`                        | Disable optional host `mprotect` dual-protection on arenas (SPC remains on)                           |
 | `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower mode (default **sticky** = sticky TLB + stack pin)                                      |
 | `WIE_JIT_CHAIN=0`                       | Disable FuncRef chaining / chain table / edge IC                                                      |
@@ -143,23 +140,19 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 
 ## CLI
 
+Three fundamental commands (`run-micro` / `entry-trace` remain as aliases):
+
 ```bash
 ./target/release/wie-cli --help
-./target/release/wie-cli run-micro --help
+./target/release/wie-cli run --help
 ```
 
-| Command                                      | Role                                                                      |
-| -------------------------------------------- | ------------------------------------------------------------------------- |
-| `inspect` / `sections` / `imports` / `image` | PE inspection                                                             |
-| `winapi-map`                                 | Import coverage map (`--out path` optional)                               |
-| `run-micro`                                  | **Primary** gate (must reach `ExitProcess` with expected code, default 0) |
-| `run-micro … --max-api N`                    | Cap host API stops (default 256)                                          |
-| `run-micro … --expect-code N`                | Expected `ExitProcess` code                                               |
-| `run-micro … --root DIR`                     | Bottle root (`C:\…` → `{DIR}/drive_c/…`)                                  |
-| `run-micro … --stdin FILE -- args…`          | Inject console stdin + guest argv                                         |
-| `run-micro … -- args…` (no `--stdin`)        | Live host stdin on guest `ReadFile(STD_INPUT)`                            |
-| `run`                                        | Run until yield / exit (`--max-api`, default 3400)                        |
-| `entry-trace`                                | First N host API stops (`--max-api`, default 20)                          |
+| Command | Role |
+| ------- | ---- |
+| `inspect <pe>` | PE metadata; flags: `--sections`, `--imports` / `--find`, `--image`, `--winapi-map` / `--out` |
+| `run <pe>` | **Primary** micro gate (`ExitProcess`); `--max-api` (256), `--expect-code`, `--root`, `--stdin`, guest argv after `--` |
+| `run <pe> --persistent` | Persistent loop until yield/exit (`--max-api` default 3400) |
+| `trace <pe>` | First N host API stops (`--max-api`, default 20) |
 
 ## Performance notes (CPU / wall)
 
@@ -168,7 +161,7 @@ Phases 0–5 landed; baselines and design notes:
 | Doc                                                            | Topic                                   |
 | -------------------------------------------------------------- | --------------------------------------- |
 | [`docs/phase0-baseline.md`](docs/phase0-baseline.md)           | Wall/CPU%, host stops, JIT counters     |
-| [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md)   | Hybrid / mmap / hash storage            |
+| [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md)   | Mmap arena storage (historical dual-backend notes) |
 | [`docs/phase3-permissions.md`](docs/phase3-permissions.md)     | SPC, PageMap/VAD, `Virtual*`            |
 | [`docs/phase4-foundation.md`](docs/phase4-foundation.md)       | Sticky TLB + kill-switches              |
 | [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md)     | Stack/heap pins + block-wide super path |
@@ -198,7 +191,7 @@ What actually burns CPU today:
 4. **Block entry/exit** — GPR sync is mandatory; XMM sync is skipped for pure GPR blocks.
 5. **Cold compile tax** — hotness threshold avoids compiling one-shot code; short micros spend most wall in session init.
 
-Further wins worth pursuing: denser stop/API lookup; full wait objects beyond Sleep/GetMessage; optional SIGSEGV fault epic (explicit non-goal of Phases 0–7).
+Further wins worth pursuing: full wait objects beyond Sleep/GetMessage; optional SIGSEGV fault epic (explicit non-goal of Phases 0–7). **Denser API lookup** (IDs in fake VA, no HashMap on host stop) is landed.
 
 ## Installation & Prerequisites
 
@@ -245,13 +238,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 3. **Unit tests:** `cargo test --workspace`
 4. **Integration:** `make -C micro-exes && ./scripts/run-micro-suite.sh`
 
-Optional backend matrix when touching memory or JIT:
+Optional JIT matrix when touching memory lower / chaining:
 
 ```bash
-WIE_MEM=hash ./scripts/run-micro-suite.sh
-WIE_MEM=mmap ./scripts/run-micro-suite.sh
 WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh
 WIE_JIT_MEM=pin ./scripts/run-micro-suite.sh
+WIE_CPU=iced ./scripts/run-micro-suite.sh
 ```
 
 ## Acknowledgments

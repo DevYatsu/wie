@@ -48,7 +48,13 @@ pub struct GuestRegion {
 impl GuestRegion {
     /// Construct a region without a host base.
     #[must_use]
-    pub fn new(name: impl Into<String>, kind: RegionKind, base: u64, size: usize, perms: u32) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        kind: RegionKind,
+        base: u64,
+        size: usize,
+        perms: u32,
+    ) -> Self {
         Self {
             name: name.into(),
             kind,
@@ -152,7 +158,13 @@ mod tests {
     #[test]
     fn find_region_by_va() {
         let mut t = RegionTable::new();
-        t.register(GuestRegion::new("stack", RegionKind::Stack, 0x2000_0000, 0x1_0000, 7));
+        t.register(GuestRegion::new(
+            "stack",
+            RegionKind::Stack,
+            0x2000_0000,
+            0x1_0000,
+            7,
+        ));
         t.register(GuestRegion::new(
             "heap",
             RegionKind::Heap,
@@ -160,14 +172,8 @@ mod tests {
             0x100_0000,
             7,
         ));
-        assert_eq!(
-            t.find(0x2000_1000).expect("stack").name,
-            "stack"
-        );
-        assert_eq!(
-            t.find(0x1_6000_0040).expect("heap").name,
-            "heap"
-        );
+        assert_eq!(t.find(0x2000_1000).expect("stack").name, "stack");
+        assert_eq!(t.find(0x1_6000_0040).expect("heap").name, "heap");
         assert!(t.find(0x1000).is_none());
         assert_eq!(t.by_name("stack").expect("name").base, 0x2000_0000);
     }

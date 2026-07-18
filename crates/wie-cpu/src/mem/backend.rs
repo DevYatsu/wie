@@ -1,8 +1,8 @@
-//! Guest memory storage backend trait (Phase 1–2).
+//! Guest memory storage backend trait.
 //!
-//! Implementations own page data. [`crate::mem::hashmap::HashMapBackend`] uses
-//! a radix of non-owning page pointers; [`crate::mem::mmap_arena::MmapArenaBackend`]
-//! owns contiguous anonymous arenas and derives host pointers by soft translation.
+//! Runtime storage is always [`crate::mem::mmap_arena::MmapArenaBackend`]:
+//! contiguous anonymous arenas with soft translation (guest VA ≠ host VA).
+//! The trait remains for unit tests / oracle (`mmap_page` vs arena).
 
 use crate::CpuError;
 
@@ -13,6 +13,8 @@ pub const PAGE_SIZE_USIZE: usize = 0x1000;
 /// `log2(PAGE_SIZE)` — prefer shifts over division for page keys.
 pub(crate) const PAGE_SHIFT: u32 = 12;
 
+/// Page key for tests / oracle (`va >> PAGE_SHIFT`). Runtime uses the shift inline.
+#[cfg(test)]
 #[inline]
 pub(crate) fn page_key(va: u64) -> u64 {
     va >> PAGE_SHIFT
@@ -36,7 +38,7 @@ pub trait GuestMemBackend {
     /// Host pointer to a mapped page's data (JIT TLB). `page_key = va >> PAGE_SHIFT`.
     fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8>;
 
-    /// Fast page-table walk without HashMap (may be identical to [`page_data_ptr`]).
+    /// Fast page-table walk (may be identical to [`page_data_ptr`]).
     fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8>;
 
     /// Fill `out` (≤15 bytes) from guest `address` for instruction fetch.
@@ -61,7 +63,7 @@ pub trait GuestMemBackend {
         )))
     }
 
-    /// Backend name for diagnostics (`hash`, `mmap_page`, …).
+    /// Backend name for diagnostics (`mmap`, `mmap_page`, …).
     fn name(&self) -> &'static str;
 }
 

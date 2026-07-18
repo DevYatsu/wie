@@ -293,6 +293,26 @@ pub enum WinApiId {
 
 pub const WINAPI_ID_COUNT: usize = 279;
 
+impl WinApiId {
+    /// Discriminant as `u16` (`#[repr(u16)]`).
+    #[must_use]
+    #[allow(clippy::as_conversions)]
+    pub const fn to_u16(self) -> u16 {
+        self as u16
+    }
+
+    /// Reconstruct from the dense discriminant (`0 .. WINAPI_ID_COUNT`).
+    #[must_use]
+    #[allow(clippy::as_conversions, unsafe_code)]
+    pub const fn from_u16(raw: u16) -> Option<Self> {
+        if (raw as usize) >= WINAPI_ID_COUNT {
+            return None;
+        }
+        // SAFETY: `WinApiId` is `#[repr(u16)]` with contiguous discriminants 0..COUNT.
+        Some(unsafe { core::mem::transmute::<u16, Self>(raw) })
+    }
+}
+
 /// Static (library, name, id) rows for one-time resolution.
 static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
     (
@@ -1254,6 +1274,19 @@ pub fn resolve_winapi_id(library: &str, name: &str) -> Option<WinApiId> {
     None
 }
 
+/// Reverse lookup: dense id → (`library`, `export`) as stored in the name table.
+///
+/// Names are lowercase (as in `WINAPI_NAME_ROWS`). Used for trace/profile only.
+#[must_use]
+pub fn winapi_id_export(id: WinApiId) -> Option<(&'static str, &'static str)> {
+    for &(lib, export, row_id) in WINAPI_NAME_ROWS {
+        if row_id == id {
+            return Some((lib, export));
+        }
+    }
+    None
+}
+
 #[must_use]
 pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
     resolve_winapi_id(library, name).is_some()
@@ -1771,9 +1804,7 @@ impl WinApiId {
             | Self::User32Getsystemmetrics
             | Self::User32Getsyscolor
             | Self::User32Getsyscolorbrush
-            | Self::User32Getdesktopwindow => {
-                WinApiTraits::EMPTY.with_noisy().with_guest_stub()
-            }
+            | Self::User32Getdesktopwindow => WinApiTraits::EMPTY.with_noisy().with_guest_stub(),
             Self::Kernel32Getfileinformationbyhandle
             | Self::Kernel32Getfiletype
             | Self::Kernel32Getprocaddress

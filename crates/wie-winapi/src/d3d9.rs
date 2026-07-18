@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
 
+use crate::fake_va::{
+    COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, encode_com,
+};
 use crate::guest_memory::{
     read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
     write_u64 as write_guest_u64,
@@ -15,35 +18,35 @@ const IDIRECT3D9_ALLOCATION_SIZE: u64 = 0x100;
 /// Offset of the COM object after its vtable.
 const IDIRECT3D9_OBJECT_OFFSET: u64 = 0x90;
 
-/// Named `IDirect3D9` method slots.
+/// Named `IDirect3D9` method slots (order matches real Direct3D 9 COM).
 ///
-/// Slot order must match the real Direct3D 9 COM interface. Addresses are the
-/// single source of truth for both vtable construction and runtime dispatch.
-pub const IDIRECT3D9_METHODS: &[(u64, &str)] = &[
-    (0x0000_7000_0000_9000, "IDirect3D9::QueryInterface"),
-    (0x0000_7000_0000_9010, "IDirect3D9::AddRef"),
-    (0x0000_7000_0000_9020, "IDirect3D9::Release"),
-    (0x0000_7000_0000_9030, "IDirect3D9::RegisterSoftwareDevice"),
-    (0x0000_7000_0000_9040, "IDirect3D9::GetAdapterCount"),
-    (0x0000_7000_0000_9050, "IDirect3D9::GetAdapterIdentifier"),
-    (0x0000_7000_0000_9060, "IDirect3D9::GetAdapterModeCount"),
-    (0x0000_7000_0000_9070, "IDirect3D9::EnumAdapterModes"),
-    (0x0000_7000_0000_9080, "IDirect3D9::GetAdapterDisplayMode"),
-    (0x0000_7000_0000_9090, "IDirect3D9::CheckDeviceType"),
-    (0x0000_7000_0000_90a0, "IDirect3D9::CheckDeviceFormat"),
-    (
-        0x0000_7000_0000_90b0,
-        "IDirect3D9::CheckDeviceMultiSampleType",
-    ),
-    (0x0000_7000_0000_90c0, "IDirect3D9::CheckDepthStencilMatch"),
-    (
-        0x0000_7000_0000_90d0,
-        "IDirect3D9::CheckDeviceFormatConversion",
-    ),
-    (0x0000_7000_0000_90e0, "IDirect3D9::GetDeviceCaps"),
-    (0x0000_7000_0000_90f0, "IDirect3D9::GetAdapterMonitor"),
-    (0x0000_7000_0000_9100, "IDirect3D9::CreateDevice"),
+/// Fake VAs are derived via [`idirect3d9_method_va`] (dense COM encoding).
+pub const IDIRECT3D9_METHOD_NAMES: &[&str] = &[
+    "IDirect3D9::QueryInterface",
+    "IDirect3D9::AddRef",
+    "IDirect3D9::Release",
+    "IDirect3D9::RegisterSoftwareDevice",
+    "IDirect3D9::GetAdapterCount",
+    "IDirect3D9::GetAdapterIdentifier",
+    "IDirect3D9::GetAdapterModeCount",
+    "IDirect3D9::EnumAdapterModes",
+    "IDirect3D9::GetAdapterDisplayMode",
+    "IDirect3D9::CheckDeviceType",
+    "IDirect3D9::CheckDeviceFormat",
+    "IDirect3D9::CheckDeviceMultiSampleType",
+    "IDirect3D9::CheckDepthStencilMatch",
+    "IDirect3D9::CheckDeviceFormatConversion",
+    "IDirect3D9::GetDeviceCaps",
+    "IDirect3D9::GetAdapterMonitor",
+    "IDirect3D9::CreateDevice",
 ];
+
+/// Fake target VA for `IDirect3D9` vtable slot `slot`.
+#[must_use]
+pub fn idirect3d9_method_va(slot: usize) -> u64 {
+    let method = u8::try_from(slot).unwrap_or(u8::MAX);
+    encode_com(COM_IFACE_IDIRECT3D9, method)
+}
 
 const FAKE_MONITOR_HANDLE: u64 = 0x0000_0000_6600_0010;
 
@@ -64,12 +67,6 @@ const D3DFMT_X8R8G8B8: u32 = 22;
 /// Number of methods in the `IDirect3DDevice9` vtable.
 pub const IDIRECT3DDEVICE9_METHOD_COUNT: usize = 119;
 
-/// First fake executable address used by `IDirect3DDevice9` methods.
-pub const IDIRECT3DDEVICE9_METHOD_BASE: u64 = 0x0000_7000_0000_a000;
-
-/// Byte spacing between consecutive `IDirect3DDevice9` method stubs.
-pub const IDIRECT3DDEVICE9_METHOD_STRIDE: u64 = 0x10;
-
 /// Space reserved for the device vtable and COM object.
 const IDIRECT3DDEVICE9_ALLOCATION_SIZE: u64 = 0x400;
 
@@ -82,15 +79,11 @@ const D3DCREATE_MIXED_VERTEXPROCESSING: u32 = 0x0000_0080;
 
 /// Fake target VA for `IDirect3DDevice9` vtable slot `slot`.
 pub fn idirect3ddevice9_method_va(slot: usize) -> Result<u64> {
-    let slot_u64 = u64::try_from(slot).context("IDirect3DDevice9 slot does not fit u64")?;
-
-    let byte_offset = slot_u64
-        .checked_mul(IDIRECT3DDEVICE9_METHOD_STRIDE)
-        .context("IDirect3DDevice9 method offset overflow")?;
-
-    IDIRECT3DDEVICE9_METHOD_BASE
-        .checked_add(byte_offset)
-        .context("IDirect3DDevice9 method target overflow")
+    if slot >= IDIRECT3DDEVICE9_METHOD_COUNT {
+        anyhow::bail!("IDirect3DDevice9 method slot {slot} out of range");
+    }
+    let method = u8::try_from(slot).context("IDirect3DDevice9 slot does not fit u8")?;
+    Ok(encode_com(COM_IFACE_IDIRECT3DDEVICE9, method))
 }
 
 /// Dispatch name for `IDirect3DDevice9` vtable slot `slot`.
@@ -123,7 +116,7 @@ pub fn handle_direct3d_create9(
         if vtable_address == 0 {
             0
         } else {
-            for (slot, &(method_address, _)) in IDIRECT3D9_METHODS.iter().enumerate() {
+            for slot in 0..IDIRECT3D9_METHOD_NAMES.len() {
                 let slot_u64 =
                     u64::try_from(slot).context("IDirect3D9 vtable slot does not fit u64")?;
 
@@ -135,7 +128,7 @@ pub fn handle_direct3d_create9(
                     .checked_add(byte_offset)
                     .context("IDirect3D9 vtable entry address overflow")?;
 
-                write_guest_u64(engine, entry_address, method_address)?;
+                write_guest_u64(engine, entry_address, idirect3d9_method_va(slot))?;
             }
 
             let object_address = vtable_address

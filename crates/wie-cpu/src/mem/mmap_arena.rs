@@ -1,4 +1,4 @@
-//! Contiguous anonymous `mmap` storage backend (`WIE_MEM=mmap`, Phase 2.1).
+//! Contiguous anonymous `mmap` storage backend (sole runtime path).
 //!
 //! Each guest `map` becomes one demand-zero arena. Soft translate via
 //! [`super::arena::ArenaSet`]. Radix page tables are not used: page host
@@ -54,11 +54,7 @@ impl MmapArenaBackend {
     }
 
     /// MEM_DECOMMIT: zero host bytes, keep mapping.
-    pub(super) fn discard_range(
-        &mut self,
-        address: u64,
-        size: usize,
-    ) -> Result<(), CpuError> {
+    pub(super) fn discard_range(&mut self, address: u64, size: usize) -> Result<(), CpuError> {
         self.arenas.discard_range(address, size)
     }
 
@@ -103,8 +99,8 @@ impl GuestMemBackend for MmapArenaBackend {
 #[cfg(test)]
 #[expect(clippy::expect_used, clippy::as_conversions, unsafe_code)]
 mod tests {
-    use super::*;
     use super::super::backend::PAGE_SIZE_USIZE;
+    use super::*;
 
     #[test]
     fn page_ptrs_are_contiguous() {

@@ -1484,7 +1484,11 @@ fn string_stos(
                     unsafe {
                         host_fill_pattern(host, byte_len, val, size);
                     }
-                    let delta = if step > 0 { byte_len_u } else { byte_len_u.wrapping_neg() };
+                    let delta = if step > 0 {
+                        byte_len_u
+                    } else {
+                        byte_len_u.wrapping_neg()
+                    };
                     regs.set_rdi(rdi.wrapping_add(delta));
                     regs.set_rcx(regs.rcx().saturating_sub(count));
                     return Ok(true);
@@ -1578,10 +1582,7 @@ fn string_movs(
         let (src_lo, dst_lo) = if step > 0 {
             (rsi, rdi)
         } else {
-            (
-                rsi.wrapping_sub(last_off),
-                rdi.wrapping_sub(last_off),
-            )
+            (rsi.wrapping_sub(last_off), rdi.wrapping_sub(last_off))
         };
         let overlap = ranges_overlap(src_lo, dst_lo, byte_len_u);
         // Phase 4.3: non-overlapping guest ranges + soft-translated host spans

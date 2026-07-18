@@ -166,7 +166,9 @@ impl GuestStubKind {
                 buf.extend_from_slice(&[0x48, 0x01, 0xc8, 0xc3]);
                 buf
             }
-            Self::GetCurrentDirectoryW { cwd_blob_va } => encode_get_current_directory_w(cwd_blob_va),
+            Self::GetCurrentDirectoryW { cwd_blob_va } => {
+                encode_get_current_directory_w(cwd_blob_va)
+            }
         }
     }
 

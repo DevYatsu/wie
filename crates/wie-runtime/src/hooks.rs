@@ -1,11 +1,13 @@
-//! Fake API registration and lookup for the runtime hook range.
+//! Fake API registration and dense VA decode for the runtime hook range.
 
 use anyhow::Result;
-use std::collections::HashMap;
 use std::sync::Arc;
-use wie_winapi::{WinApiId, WinApiTraits, resolve_winapi_id};
+use wie_winapi::{
+    FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export, encode_unresolved,
+    resolve_winapi_id, winapi_id_export,
+};
 
-/// Runtime fake API dispatch entry.
+/// Runtime fake API dispatch entry (IAT soft slots + trace metadata).
 #[derive(Debug, Clone)]
 pub struct RuntimeFakeApiEntry {
     /// Fake API target virtual address.
@@ -17,13 +19,65 @@ pub struct RuntimeFakeApiEntry {
     /// Imported function name.
     pub name: Arc<str>,
 
-    /// Runtime `IAT` slot virtual address.
+    /// Runtime `IAT` slot virtual address (0 if not from IAT).
     pub iat_slot_va: u64,
 
-    /// Pre-resolved dense handler id (None = unimplemented / special-cased).
+    /// Pre-resolved dense handler id (None = soft / string dispatch).
     pub winapi_id: Option<WinApiId>,
 
     /// Hot-path classification resolved once at table build.
+    pub traits: WinApiTraits,
+}
+
+/// Soft (unresolved) table: indexed by dense soft payload, not a HashMap.
+#[derive(Debug, Default, Clone)]
+pub struct SoftApiTable {
+    entries: Vec<RuntimeFakeApiEntry>,
+}
+
+impl SoftApiTable {
+    #[must_use]
+    pub fn get(&self, index: u16) -> Option<&RuntimeFakeApiEntry> {
+        self.entries.get(index as usize)
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[RuntimeFakeApiEntry] {
+        &self.entries
+    }
+
+    /// Intern `(library, name)` → encoded VA (stable across duplicates).
+    pub fn intern(
+        &mut self,
+        library: &str,
+        name: &str,
+        iat_slot_va: u64,
+    ) -> Result<(u64, RuntimeFakeApiEntry)> {
+        if let Some(existing) = self.entries.iter().find(|e| {
+            e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name)
+        }) {
+            return Ok((existing.fake_target_va, existing.clone()));
+        }
+
+        let idx = self.entries.len();
+        let idx_u16 =
+            u16::try_from(idx).map_err(|_| anyhow::anyhow!("soft API table exceeds 32767"))?;
+        if idx_u16 >= 0x8000 {
+            anyhow::bail!("soft API table exceeds encoding capacity");
+        }
+        let va = encode_unresolved(idx_u16);
+        let entry = make_entry(va, library.to_owned(), name.to_owned(), iat_slot_va);
+        self.entries.push(entry.clone());
+        Ok((va, entry))
+    }
+}
+
+/// Resolved stop target after bit-decode (no HashMap).
+#[derive(Debug, Clone)]
+pub struct ResolvedFakeApi {
+    pub library: Arc<str>,
+    pub name: Arc<str>,
+    pub winapi_id: Option<WinApiId>,
     pub traits: WinApiTraits,
 }
 
@@ -66,7 +120,22 @@ fn make_entry(
     }
 }
 
-fn build_runtime_fake_api_entries(
+/// Resolve import to dense fake VA; grows `soft` for non-WinApiId exports.
+pub fn resolve_import_fake_va(
+    library: &str,
+    name: &str,
+    iat_slot_va: u64,
+    soft: &mut SoftApiTable,
+) -> Result<(u64, RuntimeFakeApiEntry)> {
+    if let Some(id) = resolve_winapi_id(library, name) {
+        let va = encode_export(id);
+        return Ok((va, make_entry(va, library.to_owned(), name.to_owned(), iat_slot_va)));
+    }
+    soft.intern(library, name, iat_slot_va)
+}
+
+/// Build IAT-side entry list for guest stubs / rewire (not used for hot-path lookup).
+pub(crate) fn build_iat_fake_api_entries(
     patched_imports: &[wie_pe::PePatchedImport],
 ) -> Vec<RuntimeFakeApiEntry> {
     patched_imports
@@ -82,51 +151,87 @@ fn build_runtime_fake_api_entries(
         .collect()
 }
 
-/// Builds the complete fake-API table: IAT imports + dynamic exports + D3D vtables.
-pub(crate) fn build_all_runtime_fake_api_entries(
-    patched_imports: &[wie_pe::PePatchedImport],
-) -> Result<(Vec<RuntimeFakeApiEntry>, HashMap<u64, usize>)> {
-    let mut fake_api_entries = build_runtime_fake_api_entries(patched_imports);
-
-    for entry in wie_winapi::dynamic_apis::DYNAMIC_FAKE_APIS {
-        fake_api_entries.push(make_entry(
-            entry.fake_target_va,
-            entry.library.to_owned(),
-            entry.name.to_owned(),
-            0,
-        ));
+/// O(1) decode of a host-stop address into dispatch metadata.
+pub(crate) fn resolve_fake_api_at(
+    address: u64,
+    soft: &SoftApiTable,
+) -> Option<ResolvedFakeApi> {
+    let decoded = decode_fake_va(address)?;
+    let _ = address; // available for future trace correlation
+    match decoded {
+        FakeVa::Export(id) | FakeVa::Alias(id) => {
+            let (lib, name) = winapi_id_export(id).unwrap_or(("unknown.dll", "unknown"));
+            let mut traits = id.traits();
+            // Preserve exit-process for ExitProcess if ever given an id; CRT exits stay soft.
+            if crate::guest_stubs::classify_guest_stub(
+                lib,
+                name,
+                &crate::guest_stubs::GuestStubConfig::CLASSIFY_ONLY,
+            )
+            .is_some()
+            {
+                traits.set_guest_stub(true);
+                traits.set_noisy(true);
+            }
+            Some(ResolvedFakeApi {
+                library: Arc::<str>::from(lib),
+                name: Arc::<str>::from(name),
+                winapi_id: Some(id),
+                traits,
+            })
+        }
+        FakeVa::Unresolved(index) => {
+            let e = soft.get(index)?;
+            Some(ResolvedFakeApi {
+                library: e.library.clone(),
+                name: e.name.clone(),
+                winapi_id: e.winapi_id,
+                traits: e.traits,
+            })
+        }
+        FakeVa::Com { iface, method } => resolve_com(iface, method),
+        FakeVa::Special(_) => None, // handled by session before resolve
     }
-
-    for &(fake_target_va, name) in wie_winapi::d3d9::IDIRECT3D9_METHODS {
-        fake_api_entries.push(make_entry(
-            fake_target_va,
-            "D3D9.dll".to_owned(),
-            name.to_owned(),
-            0,
-        ));
-    }
-
-    for slot in 0..wie_winapi::d3d9::IDIRECT3DDEVICE9_METHOD_COUNT {
-        fake_api_entries.push(make_entry(
-            wie_winapi::d3d9::idirect3ddevice9_method_va(slot)?,
-            "D3D9.dll".to_owned(),
-            wie_winapi::d3d9::idirect3ddevice9_method_name(slot),
-            0,
-        ));
-    }
-
-    let mut by_va = HashMap::with_capacity(fake_api_entries.len());
-    for (index, entry) in fake_api_entries.iter().enumerate() {
-        by_va.insert(entry.fake_target_va, index);
-    }
-
-    Ok((fake_api_entries, by_va))
 }
 
-pub(crate) fn find_fake_api_entry<'a>(
-    entries: &'a [RuntimeFakeApiEntry],
-    by_va: &HashMap<u64, usize>,
-    fake_target_va: u64,
-) -> Option<&'a RuntimeFakeApiEntry> {
-    by_va.get(&fake_target_va).map(|&index| &entries[index])
+fn resolve_com(iface: u8, method: u8) -> Option<ResolvedFakeApi> {
+    use wie_winapi::{COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9};
+
+    let name = match iface {
+        COM_IFACE_IDIRECT3D9 => {
+            let names = wie_winapi::d3d9::IDIRECT3D9_METHOD_NAMES;
+            names
+                .get(usize::from(method))
+                .copied()
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| format!("IDirect3D9::Slot{method:03}"))
+        }
+        COM_IFACE_IDIRECT3DDEVICE9 => {
+            wie_winapi::d3d9::idirect3ddevice9_method_name(usize::from(method))
+        }
+        _ => format!("Com{iface}::Method{method}"),
+    };
+    let library = "D3D9.dll";
+    let winapi_id = resolve_winapi_id(library, &name);
+    let traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
+    Some(ResolvedFakeApi {
+        library: Arc::<str>::from(library),
+        name: Arc::<str>::from(name),
+        winapi_id,
+        traits,
+    })
+}
+
+/// Collect every known plantable entry for guest stubs: IAT + soft table uniques.
+pub(crate) fn collect_stub_entries(
+    iat_entries: &[RuntimeFakeApiEntry],
+    soft: &SoftApiTable,
+) -> Vec<RuntimeFakeApiEntry> {
+    let mut out = iat_entries.to_vec();
+    for e in soft.as_slice() {
+        if !out.iter().any(|x| x.fake_target_va == e.fake_target_va) {
+            out.push(e.clone());
+        }
+    }
+    out
 }

@@ -37,8 +37,7 @@
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use wie_winapi::{WinApiId, resolve_winapi_id};
+use wie_winapi::{WinApiId, encode_alias};
 
 /// Maximum simultaneously accelerated open files.
 pub const GUEST_IO_MAX_SLOTS: usize = 128;
@@ -75,10 +74,10 @@ impl GuestIoConfig {
             readfile_impl_va: code_base,
             setfp_impl_va: code_base + 0x200,
             getfs_impl_va: code_base + 0x400,
-            // Fallbacks live in the hooked fake-API range (host must stop).
-            readfile_fallback_va: layout.fake_api_base + 0xF100,
-            setfp_fallback_va: layout.fake_api_base + 0xF110,
-            getfs_fallback_va: layout.fake_api_base + 0xF120,
+            // Host-fallback aliases: same WinApiId as primary exports, distinct VA.
+            readfile_fallback_va: encode_alias(WinApiId::Kernel32Readfile),
+            setfp_fallback_va: encode_alias(WinApiId::Kernel32Setfilepointer),
+            getfs_fallback_va: encode_alias(WinApiId::Kernel32Getfilesize),
         }
     }
 }
@@ -126,12 +125,10 @@ fn guest_io_rewire() -> GuestIoRewire {
 
 /// Installs guest I/O helpers and rewires KERNEL32 file APIs to jump into them.
 ///
-/// Extends `fake_api_entries` with host-fallback VAs and clears stop-bitmap bits for
-/// the entry-point `jmp` stubs so Unicorn never leaves the guest for the fast path.
+/// Host fallbacks use dense alias VAs (`encode_alias`) — no HashMap registration.
 pub(crate) fn install_guest_io(
     engine: &mut dyn wie_cpu::CpuEngine,
-    entries: &mut Vec<RuntimeFakeApiEntry>,
-    by_va: &mut HashMap<u64, usize>,
+    entries: &[RuntimeFakeApiEntry],
     stop_bitmap: &mut [u8],
     layout: &RuntimeMemoryLayout,
 ) -> Result<GuestIoConfig> {
@@ -147,29 +144,6 @@ pub(crate) fn install_guest_io(
     write_readfile_impl(engine, &config)?;
     write_setfilepointer_impl(engine, &config)?;
     write_getfilesize_impl(engine, &config)?;
-
-    // Register host fallbacks (same handlers as the public exports).
-    register_fallback(
-        entries,
-        by_va,
-        config.readfile_fallback_va,
-        "KERNEL32.dll",
-        "ReadFile",
-    );
-    register_fallback(
-        entries,
-        by_va,
-        config.setfp_fallback_va,
-        "KERNEL32.dll",
-        "SetFilePointer",
-    );
-    register_fallback(
-        entries,
-        by_va,
-        config.getfs_fallback_va,
-        "KERNEL32.dll",
-        "GetFileSize",
-    );
 
     let rewire = guest_io_rewire();
     let mut api = crate::guest_rewire::FakeApiRewire {
@@ -196,37 +170,6 @@ pub(crate) fn install_guest_io(
     );
 
     Ok(config)
-}
-
-fn register_fallback(
-    entries: &mut Vec<RuntimeFakeApiEntry>,
-    by_va: &mut HashMap<u64, usize>,
-    va: u64,
-    library: &str,
-    name: &str,
-) {
-    if by_va.contains_key(&va) {
-        return;
-    }
-    let winapi_id = resolve_winapi_id(library, name);
-    let mut traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
-    // Fallbacks are host paths for I/O — mark noisy like the primary exports.
-    if name.eq_ignore_ascii_case("ReadFile")
-        || name.eq_ignore_ascii_case("SetFilePointer")
-        || name.eq_ignore_ascii_case("GetFileSize")
-    {
-        traits.set_noisy(true);
-    }
-    let index = entries.len();
-    entries.push(RuntimeFakeApiEntry {
-        fake_target_va: va,
-        library: library.into(),
-        name: name.into(),
-        iat_slot_va: 0,
-        winapi_id,
-        traits,
-    });
-    by_va.insert(va, index);
 }
 
 // ---------------------------------------------------------------------------

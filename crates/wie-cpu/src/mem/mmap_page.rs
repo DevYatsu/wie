@@ -1,7 +1,7 @@
 //! Per-page anonymous `mmap` backend for oracle tests (Phase 1.3).
 //!
 //! Not the Phase 2 arena backend: each guest page is a separate `mmap` mapping.
-//! Used to prove `GuestMemBackend` semantic parity with [`super::HashMapBackend`].
+//! Per-page mmap backend for oracle tests vs [`super::MmapArenaBackend`].
 //!
 //! `unsafe` is confined to map/unmap and to forming a page slice from the mmap
 //! pointer; all indexing goes through safe `get`/`get_mut`.

@@ -6,11 +6,12 @@ This roadmap outlines the planned evolution of WIE’s memory management, JIT op
 
 ## Guiding Principles
 
-1. **Guest VA ≠ Host VA** – Always use a soft translation layer (region table, radix tree, TLB). No `mmap(addr = guest_va)`.
-2. **Dual‑backend safety** – Keep the existing `HashMap`‑based storage as a fallback (`WIE_MEM=hash`) while developing the new `mmap` backend.
+1. **Guest VA ≠ Host VA** – Always use a soft translation layer (region table, arenas, TLB). No `mmap(addr = guest_va)`.
+2. **Mmap-only storage** – Runtime guest pages live in anonymous arenas only (legacy `hash` / `hybrid` removed in the great cleanup).
 3. **Parity first, speed second** – The entire micro‑suite must remain green before any JIT fast‑path is enabled.
 4. **Targeted arenas** – Only map critical memory regions (heap, stack, image, file cache). Do **not** reserve a fixed 4 GB low address space.
 5. **Incremental, self‑contained PRs** – Each phase is a separate, reviewable step.
+6. **Dense fake-API VAs** – Library/function identity is encoded in the guest stop address (`wie_winapi::fake_va`); host-stop path is bit-mask decode, not a HashMap.
 
 ---
 
@@ -292,17 +293,31 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ### 7.3 Default Flip ✅
 
-- Default `WIE_MEM=mmap`; keep `hash` and `hybrid` as explicit overrides.
+- Default `WIE_MEM=mmap`; keep `hash` and `hybrid` as explicit overrides (Phase 7).
 - README: mmap is storage throughput / soft arenas — **not** idle CPU (Phase 6).
 
-**DoD:** Default path is mmap; `hash` / `hybrid` continue to work. ✅
+**DoD:** Default path is mmap; `hash` / `hybrid` continue to work. ✅  
+**Superseded:** great cleanup removes `hash` / `hybrid` entirely (mmap sole path).
 
 ### 7.4 Rollback Playbook ✅
 
-- [`docs/RUNBOOK.md`](docs/RUNBOOK.md): symptoms → `WIE_MEM=hash|hybrid`, `WIE_CPU=iced`, idle/JIT knobs.
-- `WIE_RUNTIME_PROFILE=1` reports `mem_backend` + `idle_policy`.
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md): symptoms → `WIE_CPU=iced`, idle/JIT knobs (no mem-backend switch).
+- `WIE_RUNTIME_PROFILE=1` reports `mem_backend=mmap` + `idle_policy`.
 
 **DoD:** Regressions mitigable by env. ✅
+
+---
+
+## Great cleanup (post Phase 7) ✅
+
+**Goal:** Delete dual-backend scaffolding before multithreading so there is one memory path and a small CLI surface.
+
+- Remove `HashMapBackend`, `HybridBackend`, `WIE_MEM`, and the `Storage` enum; `GuestMemory` owns `MmapArenaBackend` only.
+- Oracle tests compare `mmap_arena` vs per-page `mmap_page` (test-only).
+- CLI compressed to **`inspect` / `run` / `trace`** (`run-micro` / `entry-trace` aliases retained).
+- Docs/RUNBOOK updated: no hash/hybrid rollback path.
+
+**DoD:** Workspace tests + micro-suite green on mmap-only; no `WIE_MEM` knobs.
 
 ---
 

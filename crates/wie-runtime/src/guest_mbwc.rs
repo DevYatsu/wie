@@ -10,8 +10,7 @@
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use wie_winapi::{WinApiId, resolve_winapi_id};
+use wie_winapi::{WinApiId, encode_alias};
 
 #[derive(Debug, Clone)]
 pub struct GuestMbwcConfig {
@@ -24,28 +23,19 @@ impl GuestMbwcConfig {
     pub fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
         Self {
             impl_va: layout.guest_mbwc_code_base,
-            fallback_va: layout.fake_api_base + 0xF300,
+            fallback_va: encode_alias(WinApiId::Kernel32Multibytetowidechar),
         }
     }
 }
 
 pub(crate) fn install_guest_mbwc(
     engine: &mut dyn wie_cpu::CpuEngine,
-    entries: &mut Vec<RuntimeFakeApiEntry>,
-    by_va: &mut HashMap<u64, usize>,
+    entries: &[RuntimeFakeApiEntry],
     stop_bitmap: &mut [u8],
     layout: &RuntimeMemoryLayout,
 ) -> Result<GuestMbwcConfig> {
     let config = GuestMbwcConfig::from_layout(layout);
     write_mbwc_impl(engine, &config)?;
-
-    register_fallback(
-        entries,
-        by_va,
-        config.fallback_va,
-        "KERNEL32.dll",
-        "MultiByteToWideChar",
-    );
 
     // Default OFF: per-character expand in Unicorn is slower wall-clock than one
     // host stop + bulk mem_write for WIE's CP_UTF8 traffic. Opt in with WIE_GUEST_MBWC=1.
@@ -70,31 +60,6 @@ pub(crate) fn install_guest_mbwc(
         "installed guest MultiByteToWideChar acceleration"
     );
     Ok(config)
-}
-
-fn register_fallback(
-    entries: &mut Vec<RuntimeFakeApiEntry>,
-    by_va: &mut HashMap<u64, usize>,
-    va: u64,
-    library: &str,
-    name: &str,
-) {
-    if by_va.contains_key(&va) {
-        return;
-    }
-    let winapi_id = resolve_winapi_id(library, name);
-    let mut traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
-    traits.set_noisy(true);
-    let index = entries.len();
-    entries.push(RuntimeFakeApiEntry {
-        fake_target_va: va,
-        library: library.into(),
-        name: name.into(),
-        iat_slot_va: 0,
-        winapi_id,
-        traits,
-    });
-    by_va.insert(va, index);
 }
 
 fn patch_rel32(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {

@@ -176,9 +176,7 @@ impl std::fmt::Debug for ArenaSet {
 impl ArenaSet {
     #[must_use]
     pub(super) fn new() -> Self {
-        Self {
-            arenas: Vec::new(),
-        }
+        Self { arenas: Vec::new() }
     }
 
     /// Binary-search index of the arena that may contain `va` (largest base ≤ va).
@@ -282,17 +280,15 @@ impl ArenaSet {
         let mut offset = 0_usize;
         let mut va = address;
         while offset < bytes.len() {
-            let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
-                CpuError::Message("page offset does not fit usize".into())
-            })?;
-            let arena = self.find_va(va).ok_or_else(|| {
-                CpuError::Message(format!("mem_read unmapped {va:#x}"))
-            })?;
+            let page_off = usize::try_from(va & (PAGE_SIZE - 1))
+                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
+            let arena = self
+                .find_va(va)
+                .ok_or_else(|| CpuError::Message(format!("mem_read unmapped {va:#x}")))?;
             // SAFETY: exclusive to read path; shared borrow of arena set.
             let slice = unsafe { arena.as_slice() };
-            let arena_off = usize::try_from(va.saturating_sub(arena.guest_base())).map_err(
-                |_| CpuError::Message("arena offset does not fit usize".into()),
-            )?;
+            let arena_off = usize::try_from(va.saturating_sub(arena.guest_base()))
+                .map_err(|_| CpuError::Message("arena offset does not fit usize".into()))?;
             let room_in_page = PAGE_SIZE_USIZE.saturating_sub(page_off);
             let room_in_arena = arena.size().saturating_sub(arena_off);
             let remaining = bytes.len().saturating_sub(offset);
@@ -321,22 +317,21 @@ impl ArenaSet {
         let mut offset = 0_usize;
         let mut va = address;
         while offset < bytes.len() {
-            let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
-                CpuError::Message("page offset does not fit usize".into())
-            })?;
+            let page_off = usize::try_from(va & (PAGE_SIZE - 1))
+                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
             // Split borrow: locate index then mutably borrow.
-            let i = self.candidate_index(va).ok_or_else(|| {
-                CpuError::Message(format!("mem_write unmapped {va:#x}"))
-            })?;
-            let arena = self.arenas.get_mut(i).ok_or_else(|| {
-                CpuError::Message(format!("mem_write unmapped {va:#x}"))
-            })?;
+            let i = self
+                .candidate_index(va)
+                .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
+            let arena = self
+                .arenas
+                .get_mut(i)
+                .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
             if !arena.contains_va(va) {
                 return Err(CpuError::Message(format!("mem_write unmapped {va:#x}")));
             }
-            let arena_off = usize::try_from(va.saturating_sub(arena.guest_base())).map_err(
-                |_| CpuError::Message("arena offset does not fit usize".into()),
-            )?;
+            let arena_off = usize::try_from(va.saturating_sub(arena.guest_base()))
+                .map_err(|_| CpuError::Message("arena offset does not fit usize".into()))?;
             let room_in_page = PAGE_SIZE_USIZE.saturating_sub(page_off);
             let room_in_arena = arena.size().saturating_sub(arena_off);
             let remaining = bytes.len().saturating_sub(offset);
@@ -397,9 +392,8 @@ impl ArenaSet {
             let mapped = self.find_va(page_va).is_some();
             if mapped {
                 if let Some(start) = run_start.take() {
-                    let run_size = usize::try_from(page_va.saturating_sub(start)).map_err(
-                        |_| CpuError::Message("mmap arena run size overflow".into()),
-                    )?;
+                    let run_size = usize::try_from(page_va.saturating_sub(start))
+                        .map_err(|_| CpuError::Message("mmap arena run size overflow".into()))?;
                     if run_size > 0 {
                         let arena = MmapArena::map_new(start, run_size, perms)?;
                         self.insert(arena)?;
@@ -411,9 +405,8 @@ impl ArenaSet {
             page_va = page_va.saturating_add(PAGE_SIZE);
         }
         if let Some(start) = run_start {
-            let run_size = usize::try_from(end.saturating_sub(start)).map_err(|_| {
-                CpuError::Message("mmap arena run size overflow".into())
-            })?;
+            let run_size = usize::try_from(end.saturating_sub(start))
+                .map_err(|_| CpuError::Message("mmap arena run size overflow".into()))?;
             if run_size > 0 {
                 let arena = MmapArena::map_new(start, run_size, perms)?;
                 self.insert(arena)?;
@@ -480,22 +473,12 @@ impl ArenaSet {
             return Ok(());
         }
         // SAFETY: host came from mmap of arena.size; offset+size host-page aligned in arena.
-        let rc = unsafe {
-            libc::mprotect(arena.host().add(off_usize).cast(), size, prot)
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(())
-        }
+        let rc = unsafe { libc::mprotect(arena.host().add(off_usize).cast(), size, prot) };
+        if rc == 0 { Ok(()) } else { Err(()) }
     }
 
     /// Zero host bytes in `[address, address+size)` without munmap (MEM_DECOMMIT).
-    pub(super) fn discard_range(
-        &mut self,
-        address: u64,
-        size: usize,
-    ) -> Result<(), CpuError> {
+    pub(super) fn discard_range(&mut self, address: u64, size: usize) -> Result<(), CpuError> {
         if size == 0 {
             return Ok(());
         }
@@ -504,9 +487,8 @@ impl ArenaSet {
         let mut va = address;
         while offset < size {
             let remaining = size.saturating_sub(offset);
-            let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
-                CpuError::Message("page offset does not fit usize".into())
-            })?;
+            let page_off = usize::try_from(va & (PAGE_SIZE - 1))
+                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
             let chunk = remaining
                 .min(PAGE_SIZE_USIZE.saturating_sub(page_off))
                 .min(zeros.len());
@@ -528,8 +510,8 @@ impl ArenaSet {
 #[cfg(test)]
 #[expect(clippy::expect_used, clippy::as_conversions)]
 mod tests {
-    use super::*;
     use super::super::backend::check_map_args;
+    use super::*;
 
     #[test]
     fn map_write_read_roundtrip() {

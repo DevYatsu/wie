@@ -20,11 +20,10 @@ pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
 pub use mem::protect;
 pub use mem::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
-    GUEST_ALLOC_GRANULARITY, GuestMemBackend, GuestRegion, HashMapBackend, HybridBackend,
-    MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType,
-    MemoryBasicInformation, MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun,
-    PageState, RegionKind, RegionTable, VadNode, VadTable, align_down, align_up,
-    win32_from_cpu_error,
+    GUEST_ALLOC_GRANULARITY, GuestMemBackend, GuestRegion, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE,
+    MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType, MemoryBasicInformation,
+    MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun, PageState, RegionKind,
+    RegionTable, VadNode, VadTable, align_down, align_up, win32_from_cpu_error,
 };
 pub use regs::RegFile;
 
@@ -133,7 +132,7 @@ pub trait CpuEngine {
         None
     }
 
-    /// Active guest memory storage backend name (`hash` / `mmap` / `hybrid`).
+    /// Active guest memory storage backend name (always `mmap`).
     fn mem_backend_name(&self) -> &'static str {
         "hash"
     }

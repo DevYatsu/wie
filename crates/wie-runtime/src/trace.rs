@@ -249,8 +249,7 @@ pub fn run_persistent_until_yield(
     use wie_winapi::{IdleContext, IdlePolicy};
 
     let idle = IdlePolicy::from_env_for(IdleContext::Persistent);
-    let mut session =
-        RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
+    let mut session = RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
 
     if session.profile_enabled() {
         session.profile_mut().idle_policy = idle.as_str().to_owned();

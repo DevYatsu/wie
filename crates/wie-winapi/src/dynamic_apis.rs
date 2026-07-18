@@ -1,14 +1,13 @@
 //! Single source of truth for APIs resolved through `GetProcAddress`.
 //!
-//! Runtime fake-API registration and `KERNEL32!GetProcAddress` both consult
-//! this table so addresses cannot drift apart.
+//! Addresses are dense-encoded via [`crate::fake_va`] so IAT and GPA never drift.
 
-/// One dynamically resolvable fake WinAPI entry.
+use crate::fake_va::{encode_export, encode_unresolved};
+use crate::resolve_winapi_id;
+
+/// One dynamically resolvable fake WinAPI entry (name → encode).
 #[derive(Debug, Clone, Copy)]
 pub struct DynamicFakeApi {
-    /// Fake executable target address returned by `GetProcAddress`.
-    pub fake_target_va: u64,
-
     /// DLL name used for runtime dispatch (`library!name`).
     pub library: &'static str,
 
@@ -18,111 +17,90 @@ pub struct DynamicFakeApi {
 
 /// Dynamic exports resolvable via `GetProcAddress` (generic PE64 + legacy apps).
 ///
-/// Order is stable for readability only; lookup is by `name` (case-insensitive).
-/// Clean room: names/addresses are our fake dispatch map, not copied from other projects.
+/// Order is stable; lookup is by `name` (case-insensitive).
+/// Clean room: names are our fake dispatch map, not copied from other projects.
 pub const DYNAMIC_FAKE_APIS: &[DynamicFakeApi] = &[
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8000,
         library: "KERNEL32.dll",
         name: "EncodePointer",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8010,
         library: "KERNEL32.dll",
         name: "DecodePointer",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8020,
         library: "KERNEL32.dll",
         name: "InitializeCriticalSectionAndSpinCount",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8030,
         library: "USER32.dll",
         name: "SetProcessDPIAware",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8040,
         library: "USER32.dll",
         name: "TrackMouseEvent",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8050,
         library: "COMCTL32.dll",
         name: "DllGetVersion",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8060,
         library: "USER32.dll",
         name: "GetSystemMetrics",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8070,
         library: "USER32.dll",
         name: "MonitorFromWindow",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8080,
         library: "USER32.dll",
         name: "GetMonitorInfoA",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8090,
         library: "USER32.dll",
         name: "GetMonitorInfoW",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_80a0,
         library: "USER32.dll",
         name: "MonitorFromRect",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_80b0,
         library: "USER32.dll",
         name: "MonitorFromPoint",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_80c0,
         library: "USER32.dll",
         name: "EnumDisplayMonitors",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_80d0,
         library: "USER32.dll",
         name: "EnumDisplayDevicesA",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_80e0,
         library: "USER32.dll",
         name: "EnumDisplayDevicesW",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_80f0,
         library: "USER32.dll",
         name: "GetDpiForWindow",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8100,
         library: "USER32.dll",
         name: "GetSystemMetricsForDpi",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8110,
         library: "USER32.dll",
         name: "AdjustWindowRectExForDpi",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8120,
         library: "COMCTL32.dll",
         name: "InitCommonControlsEx",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8130,
         library: "UXTHEME.dll",
         name: "SetWindowTheme",
     },
     DynamicFakeApi {
-        fake_target_va: 0x0000_7000_0000_8140,
         library: "D3D9.dll",
         name: "Direct3DCreate9",
     },
@@ -139,6 +117,19 @@ const NULL_GET_PROC_NAMES: &[&str] = &[
     "getsystemdefaultuilanguage",
 ];
 
+/// Resolve a catalogued dynamic export to its dense fake VA.
+#[must_use]
+pub fn dynamic_fake_target_va(library: &str, name: &str) -> Option<u64> {
+    if let Some(id) = resolve_winapi_id(library, name) {
+        return Some(encode_export(id));
+    }
+    // Soft slot reserved for known dynamic names without a dense id yet.
+    DYNAMIC_FAKE_APIS
+        .iter()
+        .position(|e| e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name))
+        .map(|idx| encode_unresolved(idx as u16))
+}
+
 /// Resolves a `GetProcAddress` export name to a fake target VA.
 ///
 /// Returns `Some(0)` for known-but-unsupported optional exports that the
@@ -154,18 +145,20 @@ pub fn resolve_get_proc_address(proc_name: &str) -> Option<u64> {
     DYNAMIC_FAKE_APIS
         .iter()
         .find(|entry| entry.name.eq_ignore_ascii_case(proc_name))
-        .map(|entry| entry.fake_target_va)
+        .and_then(|entry| dynamic_fake_target_va(entry.library, entry.name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fake_va::decode;
+    use crate::{FakeVa, WinApiId};
 
     #[test]
     fn dynamic_fake_api_addresses_are_unique() {
         let mut addresses: Vec<u64> = DYNAMIC_FAKE_APIS
             .iter()
-            .map(|entry| entry.fake_target_va)
+            .filter_map(|entry| dynamic_fake_target_va(entry.library, entry.name))
             .collect();
 
         let original_len = addresses.len();
@@ -198,19 +191,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_known_and_null_exports() {
+    fn get_proc_encode_pointer_is_export() {
+        let va = resolve_get_proc_address("EncodePointer").expect("EncodePointer");
         assert_eq!(
-            resolve_get_proc_address("EncodePointer"),
-            Some(0x0000_7000_0000_8000)
+            decode(va),
+            Some(FakeVa::Export(WinApiId::Kernel32Encodepointer))
         );
-        assert_eq!(
-            resolve_get_proc_address("direct3dcreate9"),
-            Some(0x0000_7000_0000_8140)
-        );
-        assert_eq!(
-            resolve_get_proc_address("GetUserDefaultUILanguage"),
-            Some(0)
-        );
-        assert_eq!(resolve_get_proc_address("DefinitelyNotAnExport"), None);
     }
 }

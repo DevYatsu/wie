@@ -5,6 +5,8 @@
 **Scope:** Stress residual invalidation, anti-Wine checks, optional `FlushInstructionCache`, default `WIE_MEM=mmap`, RUNBOOK.  
 **Does not:** re-implement Phase 4.x; identity mapping; SIGSEGV fault epic.
 
+> **Post-cleanup note:** the great cleanup removed `WIE_MEM` / hash / hybrid. Storage is mmap-only; CLI is `inspect` / `run` / `trace`. Historical dual-backend wording below is preserved as Phase 7 context.
+
 ## 7.1 Invalidation residual
 
 Core rules remain in [`phase4-code-invalidation.md`](phase4-code-invalidation.md). Phase 7 adds:
@@ -34,30 +36,27 @@ Does **not** touch host I-cache for Cranelift output (chaining stays data-plane)
 | `phase7_high_va_mmap_roundtrip` | High guest VA soft-translate R/W; host ≠ guest |
 | `phase7_map_wraparound_rejected` | Overflow `map` errors (no panic) |
 | `phase7_large_reserve_demand_zero_survives` | ≥1 GiB RESERVE ok or clean mmap error; touch one page |
-| `phase7_anti_wine_soft_translate_all_backends` | Host page ptr ≠ guest VA on hash/mmap/hybrid |
+| `phase7_anti_wine_soft_translate` | Host page ptr ≠ guest VA (mmap) |
 | `phase7_virtual_alloc_size_overflow_rejected` | Huge size rejected |
 
 **Checklist (manual / CI script):**
 
 - No `mmap` at guest VA / low 4 GiB identity reservation  
 - Soft translate only (`host + (guest_va - guest_base)`)  
-- `WIE_MEM=hash` still runs micro-suite  
 
-## 7.3 Default flip
+## 7.3 Default flip → sole path
 
-| Before | After (Phase 7) |
-| ------ | ----------------- |
-| Default `WIE_MEM=hybrid` | Default **`mmap`** |
-| Force `mmap` / `hash` / `hybrid` | Unchanged overrides |
+| Epoch | Storage |
+| ----- | ------- |
+| Pre Phase 7 | Default `WIE_MEM=hybrid`; force hash/mmap/hybrid |
+| Phase 7 | Default **`mmap`**; hash/hybrid overrides for rollback |
+| Great cleanup | **mmap only** — no `WIE_MEM`, no hash/hybrid code |
 
 ```bash
-# default is mmap
 ./scripts/run-micro-suite.sh
-WIE_MEM=hybrid ./scripts/run-micro-suite.sh   # prior default
-WIE_MEM=hash   ./scripts/run-micro-suite.sh   # full rollback
 ```
 
-**Rationale:** pure arenas for all maps (including tiny TEB/stub pages) simplify host layout; soft translate + SPC unchanged. Hybrid remains for bisect if many small arenas ever matter.
+**Rationale:** pure arenas for all maps (including tiny TEB/stub pages) simplify host layout; soft translate + SPC unchanged.
 
 **Note:** mmap improves memory-helper paths on large arenas; it does **not** reduce idle CPU (that is Phase 6 / `WIE_IDLE`).
 
@@ -72,9 +71,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo build -p wie-cli --release
 ./scripts/run-micro-suite.sh
-WIE_MEM=hash   ./scripts/run-micro-suite.sh
-WIE_MEM=hybrid ./scripts/run-micro-suite.sh
-WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
+WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run micro-exes/out/long_loop.exe
 # mem_backend=mmap, ~100% CPU on long_loop
 ```
 

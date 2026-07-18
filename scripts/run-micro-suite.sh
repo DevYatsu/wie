@@ -20,8 +20,8 @@ echo "=== micro-suite WIE_CPU=$WIE_CPU ==="
 run_one() {
   local pe="$1"
   shift
-  echo "--- run-micro $pe $* ---"
-  "$CLI" run-micro "$pe" "$@"
+  echo "--- run $pe $* ---"
+  "$CLI" run "$pe" "$@"
 }
 
 # N1 — no bottle required
@@ -43,8 +43,8 @@ printf 'CLI_IN\n' >"$CLI_STDIN"
 run_one "$ROOT/micro-exes/out/cli_args.exe" --stdin "$CLI_STDIN" -- -n 3 -m hi -i
 rm -f "$CLI_STDIN"
 # 2) Live host stdin path via pipe (no --stdin ⇒ stdin_live)
-echo "--- run-micro cli_args.exe (live pipe stdin) ---"
-printf 'hello-live\n' | "$CLI" run-micro "$ROOT/micro-exes/out/cli_args.exe" -- -n 3 -m hi -i
+echo "--- run cli_args.exe (live pipe stdin) ---"
+printf 'hello-live\n' | "$CLI" run "$ROOT/micro-exes/out/cli_args.exe" -- -n 3 -m hi -i
 
 # N2 — bottle v0
 BOTTLE="$(mktemp -d "${TMPDIR:-/tmp}/wie-bottle.XXXXXX")"

@@ -1,18 +1,15 @@
 //! Guest virtual memory for interpreter + JIT (x86-64 only).
 //!
-//! Phase 2–3 layout:
-//! - [`GuestMemBackend`] — storage trait
-//! - [`MmapArenaBackend`] — `WIE_MEM=mmap` (contiguous anonymous arenas; **default**)
-//! - [`HybridBackend`] — large arenas + sparse HashMap (`WIE_MEM=hybrid`)
-//! - [`HashMapBackend`] — `WIE_MEM=hash` (eager pages + radix; rollback)
-//! - [`RegionTable`] — named layout ranges (`host_base` filled for mmap arenas)
+//! Sole storage path: contiguous anonymous **mmap arenas** ([`MmapArenaBackend`]).
+//! Soft translate only (guest VA ≠ host VA). Layout:
+//! - [`GuestMemBackend`] — storage trait (mmap arena implements it)
+//! - [`MmapArenaBackend`] — every map → one demand-zero arena
+//! - [`RegionTable`] — named layout ranges (`host_base` filled from arenas)
 //! - [`PageMap`] / [`protect`] — Windows page state + software permission checks
 //! - [`GuestMemory`] — facade used by iced/JIT (SPC on read/write/fetch)
 
 mod arena;
 mod backend;
-mod hashmap;
-mod hybrid;
 mod mmap_arena;
 mod pagemap;
 pub mod protect;
@@ -25,8 +22,6 @@ mod mmap_page;
 mod oracle;
 
 pub use backend::{GuestMemBackend, PAGE_SIZE, PAGE_SIZE_USIZE};
-pub use hashmap::HashMapBackend;
-pub use hybrid::HybridBackend;
 pub use mmap_arena::MmapArenaBackend;
 pub use pagemap::{PageMap, PageRun, PageState};
 pub use region::{GuestRegion, RegionKind, RegionTable};
@@ -78,157 +73,6 @@ impl MemoryBasicInformation {
 #[cfg(test)]
 use backend::page_key;
 
-/// How guest pages are stored (`WIE_MEM`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MemBackendKind {
-    /// Eager HashMap + radix only.
-    Hash,
-    /// Every map is an anonymous arena.
-    Mmap,
-    /// Large maps → arena; tiny maps → HashMap.
-    Hybrid,
-}
-
-impl MemBackendKind {
-    /// Parse `WIE_MEM` (`hash` / `mmap` / `hybrid`). Default: **mmap** (Phase 7 cutover).
-    ///
-    /// Rollback: `WIE_MEM=hash` or `WIE_MEM=hybrid`.
-    #[must_use]
-    pub(crate) fn from_env() -> Self {
-        match std::env::var("WIE_MEM") {
-            Ok(v) if v.eq_ignore_ascii_case("hash") => Self::Hash,
-            Ok(v) if v.eq_ignore_ascii_case("mmap") => Self::Mmap,
-            Ok(v) if v.eq_ignore_ascii_case("hybrid") => Self::Hybrid,
-            Ok(v) if v.eq_ignore_ascii_case("mmap_page") => Self::Mmap, // alias
-            _ => Self::Mmap,
-        }
-    }
-}
-
-/// Concrete storage behind [`GuestMemory`].
-enum Storage {
-    Hash(HashMapBackend),
-    Mmap(MmapArenaBackend),
-    Hybrid(HybridBackend),
-}
-
-impl Storage {
-    fn new(kind: MemBackendKind) -> Self {
-        match kind {
-            MemBackendKind::Hash => Self::Hash(HashMapBackend::new()),
-            MemBackendKind::Mmap => Self::Mmap(MmapArenaBackend::new()),
-            MemBackendKind::Hybrid => Self::Hybrid(HybridBackend::new()),
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Hash(b) => b.name(),
-            Self::Mmap(b) => b.name(),
-            Self::Hybrid(b) => b.name(),
-        }
-    }
-
-    fn map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), crate::CpuError> {
-        match self {
-            Self::Hash(b) => b.map(address, size, perms),
-            Self::Mmap(b) => b.map(address, size, perms),
-            Self::Hybrid(b) => b.map(address, size, perms),
-        }
-    }
-
-    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), crate::CpuError> {
-        match self {
-            Self::Hash(b) => b.write(address, bytes),
-            Self::Mmap(b) => b.write(address, bytes),
-            Self::Hybrid(b) => b.write(address, bytes),
-        }
-    }
-
-    fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), crate::CpuError> {
-        match self {
-            Self::Hash(b) => b.read(address, bytes),
-            Self::Mmap(b) => b.read(address, bytes),
-            Self::Hybrid(b) => b.read(address, bytes),
-        }
-    }
-
-    fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8> {
-        match self {
-            Self::Hash(b) => b.page_data_ptr(page_key),
-            Self::Mmap(b) => b.page_data_ptr(page_key),
-            Self::Hybrid(b) => b.page_data_ptr(page_key),
-        }
-    }
-
-    fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
-        match self {
-            Self::Hash(b) => b.page_data_ptr_walk(page_key),
-            Self::Mmap(b) => b.page_data_ptr_walk(page_key),
-            Self::Hybrid(b) => b.page_data_ptr_walk(page_key),
-        }
-    }
-
-    fn fetch_into(&self, address: u64, out: &mut [u8]) -> Result<usize, crate::CpuError> {
-        match self {
-            Self::Hash(b) => b.fetch_into(address, out),
-            Self::Mmap(b) => b.fetch_into(address, out),
-            Self::Hybrid(b) => b.fetch_into(address, out),
-        }
-    }
-
-    /// Host base of an mmap arena covering `va`, if any.
-    fn arena_host_base_for_va(&self, va: u64) -> Option<u64> {
-        match self {
-            Self::Hash(_) => None,
-            Self::Mmap(b) => b.arena_host_base_for_va(va),
-            Self::Hybrid(b) => b.arena_host_base_for_va(va),
-        }
-    }
-
-    /// Guest base of an mmap arena covering `va`, if any.
-    fn arena_guest_base_for_va(&self, va: u64) -> Option<u64> {
-        match self {
-            Self::Hash(_) => None,
-            Self::Mmap(b) => b.arena_guest_base_for_va(va),
-            Self::Hybrid(b) => b.arena_guest_base_for_va(va),
-        }
-    }
-
-    /// Whether RESERVE should create host storage immediately (mmap/hybrid).
-    fn reserve_maps_host(&self) -> bool {
-        !matches!(self, Self::Hash(_))
-    }
-
-    fn unmap_range(&mut self, address: u64, size: usize) {
-        match self {
-            Self::Hash(b) => b.unmap_range(address, size),
-            Self::Mmap(b) => b.unmap_range(address, size),
-            Self::Hybrid(b) => b.unmap_range(address, size),
-        }
-    }
-
-    fn discard_range(&mut self, address: u64, size: usize) -> Result<(), crate::CpuError> {
-        match self {
-            Self::Hash(b) => {
-                b.discard_range(address, size);
-                Ok(())
-            }
-            Self::Mmap(b) => b.discard_range(address, size),
-            Self::Hybrid(b) => b.discard_range(address, size),
-        }
-    }
-
-    /// Optional host `mprotect` for a guest-range covered by an arena (no-op on hash).
-    fn mprotect_guest_range(&mut self, address: u64, size: usize, prot: i32) -> Result<(), ()> {
-        match self {
-            Self::Hash(_) => Ok(()),
-            Self::Mmap(b) => b.mprotect_guest_range(address, size, prot),
-            Self::Hybrid(b) => b.mprotect_guest_range(address, size, prot),
-        }
-    }
-}
-
 /// Whether optional host mprotect dual-protection is enabled (`WIE_MPROTECT`, default on).
 fn host_mprotect_enabled() -> bool {
     !matches!(
@@ -257,13 +101,12 @@ fn host_page_size() -> usize {
 const HOST_PROT_READ: i32 = libc::PROT_READ;
 const HOST_PROT_WRITE: i32 = libc::PROT_WRITE;
 
-/// Guest memory: pluggable backend + region registry + software page map (SPC).
+/// Guest memory: mmap arenas + region registry + software page map (SPC).
 ///
-/// Call sites keep using this type; storage is selected via `WIE_MEM`.
-/// Permission enforcement lives here (not inside backends) so all backends share
-/// identical Windows-visible behaviour.
+/// Storage is always [`MmapArenaBackend`]. Permission enforcement lives here
+/// (not inside the backend) so SPC is the sole correctness plane.
 pub(crate) struct GuestMemory {
-    backend: Storage,
+    backend: MmapArenaBackend,
     regions: RegionTable,
     pages: PageMap,
     vad: VadTable,
@@ -298,17 +141,11 @@ impl std::fmt::Debug for GuestMemory {
 }
 
 impl GuestMemory {
-    /// Create with backend from `WIE_MEM` (default hybrid).
+    /// Create guest memory with the sole mmap-arena storage backend.
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self::with_kind(MemBackendKind::from_env())
-    }
-
-    /// Create with an explicit backend kind (tests).
-    #[must_use]
-    pub(crate) fn with_kind(kind: MemBackendKind) -> Self {
         Self {
-            backend: Storage::new(kind),
+            backend: MmapArenaBackend::new(),
             regions: RegionTable::new(),
             pages: PageMap::new(),
             vad: VadTable::new(),
@@ -318,8 +155,6 @@ impl GuestMemory {
         }
     }
 
-    /// Active storage backend name (`hash` / `mmap` / `hybrid`).
-    #[must_use]
     pub(crate) fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
@@ -368,7 +203,7 @@ impl GuestMemory {
     /// **conservative** software R/W (intersection over every committed page).
     ///
     /// Returns `None` when:
-    /// - the region has no `host_base` (HashMap-only / not arena-backed),
+    /// - the region has no `host_base` (not arena-backed),
     /// - any page in the range is free/reserved or missing from the page map,
     /// - no usable R/W rights remain after intersection.
     ///
@@ -728,7 +563,7 @@ impl GuestMemory {
         let mut va = address;
         while va < end {
             let Some(arena_base) = self.backend.arena_guest_base_for_va(va) else {
-                // Sparse HashMap pages: no host mprotect.
+                // No arena covering this VA: skip host mprotect.
                 va = va.saturating_add(PAGE_SIZE);
                 continue;
             };
@@ -886,16 +721,11 @@ impl GuestMemory {
     ) -> Result<u64, crate::CpuError> {
         let (base, size_u64) = self.align_reserve_request(addr, size)?;
         self.ensure_pages_free(base, size_u64)?;
-        // Host storage: mmap/hybrid create one arena for the full reservation.
-        if self.backend.reserve_maps_host() {
-            let size_usize = usize::try_from(size_u64).map_err(|_| {
-                va_error(ERROR_NOT_ENOUGH_MEMORY, "reserve size does not fit usize")
-            })?;
-            // Host RW; SPC uses Reserved so guest cannot touch until commit.
-            self.backend.map(base, size_usize, crate::perm::ALL)?;
-        }
+        // Host storage: RESERVE creates one demand-zero arena for the full span.
         let size_usize = usize::try_from(size_u64)
             .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "reserve size does not fit usize"))?;
+        // Host RW; SPC uses Reserved so guest cannot touch until commit.
+        self.backend.map(base, size_usize, crate::perm::ALL)?;
         self.pages.set_range(
             base,
             size_usize,
@@ -907,7 +737,7 @@ impl GuestMemory {
             size: size_u64,
             allocation_protect: protect,
             mem_type: MemType::Private,
-            owns_host: self.backend.reserve_maps_host(),
+            owns_host: true,
         })?;
         self.generation = self.generation.saturating_add(1);
         Ok(base)
@@ -923,7 +753,7 @@ impl GuestMemory {
         self.ensure_pages_free(base, size_u64)?;
         let size_usize = usize::try_from(size_u64)
             .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "alloc size does not fit usize"))?;
-        // Host storage for full span (all backends).
+        // Host storage for full span.
         self.backend
             .map(base, size_usize, protect::rwx_from_page_protect(protect))?;
         self.pages
@@ -1002,10 +832,8 @@ impl GuestMemory {
             }
         }
 
-        // Hash: allocate host pages now. Mmap: storage already present from RESERVE.
-        if matches!(self.backend, Storage::Hash(_))
-            || self.backend.page_data_ptr_walk(page_base >> 12).is_none()
-        {
+        // Storage already present from RESERVE; only re-map if somehow missing.
+        if self.backend.page_data_ptr_walk(page_base >> 12).is_none() {
             self.backend.map(
                 page_base,
                 size_usize,
@@ -1093,12 +921,7 @@ impl GuestMemory {
         self.pages
             .set_range(node.allocation_base, size_usize, PageState::Free, 0)?;
         let _ = self.vad.remove_base(addr);
-        if node.owns_host {
-            self.backend.unmap_range(node.allocation_base, size_usize);
-        } else {
-            // Hash reserve-only: may have committed pages still in the map.
-            self.backend.unmap_range(node.allocation_base, size_usize);
-        }
+        self.backend.unmap_range(node.allocation_base, size_usize);
         self.generation = self.generation.saturating_add(1);
         Ok(())
     }
@@ -1248,7 +1071,7 @@ impl GuestMemory {
         }
 
         let page_off = usize::try_from(address & (backend::PAGE_SIZE - 1)).ok()?;
-        // Single-page: any backend (hash page or arena page).
+        // Single-page: resolve via page walk.
         if page_off.saturating_add(len) <= backend::PAGE_SIZE_USIZE {
             let entry = self.page_tlb_entry_walk(address >> backend::PAGE_SHIFT)?;
             if write && !entry.allow_w {
@@ -1326,7 +1149,7 @@ impl GuestMemory {
         self.page_tlb_entry(page_key).map(|e| e.host)
     }
 
-    /// Fast page-table walk (HashMap radix or arena formula).
+    /// Fast page-table walk (arena soft-translate formula).
     ///
     /// Committed-only gate (same as [`Self::page_tlb_entry`] host resolution).
     /// Callers that install a TLB must still honour protect via [`PageTlbEntry`].
@@ -1349,7 +1172,7 @@ impl GuestMemory {
         })
     }
 
-    /// Read-only walk variant of [`Self::page_tlb_entry`] (no HashMap demand-fill).
+    /// Read-only walk variant of [`Self::page_tlb_entry`].
     #[must_use]
     pub(crate) fn page_tlb_entry_walk(&self, page_key: u64) -> Option<PageTlbEntry> {
         let meta = self.page_protect_meta(page_key)?;
@@ -1460,7 +1283,7 @@ mod tests {
 
     #[test]
     fn page_table_walk_matches_map() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x10_0000, 0x2000, 7).expect("map");
         let k = page_key(0x10_0000);
         let p = mem.page_data_ptr_walk(k).expect("walk");
@@ -1472,7 +1295,7 @@ mod tests {
 
     #[test]
     fn page_table_high_va() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         let base = 0x0000_7fff_0000_0000_u64;
         mem.map(base, 0x1000, 7).expect("map high");
         let k = page_key(base);
@@ -1481,7 +1304,7 @@ mod tests {
 
     #[test]
     fn region_registry_find() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.register_region(GuestRegion::new(
             "stack",
             RegionKind::Stack,
@@ -1491,12 +1314,12 @@ mod tests {
         ));
         mem.map(0x2000_0000, 0x1_0000, 7).expect("map stack");
         assert_eq!(mem.find_region(0x2000_0800).expect("found").name, "stack");
-        assert_eq!(mem.backend_name(), "hash");
+        assert_eq!(mem.backend_name(), "mmap");
     }
 
     #[test]
     fn mmap_backend_host_base_on_register() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         mem.map(0x2000_0000, 0x1_0000, 7).expect("map stack");
         mem.register_region(GuestRegion::new(
             "stack",
@@ -1514,14 +1337,8 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_backend_name() {
-        let mem = GuestMemory::with_kind(MemBackendKind::Hybrid);
-        assert_eq!(mem.backend_name(), "hybrid");
-    }
-
-    #[test]
     fn mmap_page_ptr_walk() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         mem.map(0x10_0000, 0x2000, 7).expect("map");
         let k = page_key(0x10_0000);
         let p = mem.page_data_ptr_walk(k).expect("walk");
@@ -1531,7 +1348,7 @@ mod tests {
 
     #[test]
     fn spc_readonly_write_fails_read_ok() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x20_0000, 0x1000, crate::perm::READ)
             .expect("map RO");
         let mut buf = [0_u8; 4];
@@ -1544,7 +1361,7 @@ mod tests {
 
     #[test]
     fn page_tlb_entry_tags_ro_and_bumps_gen_on_protect() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x50_0000, 0x1000, crate::perm::ALL)
             .expect("map RWX");
         let k = page_key(0x50_0000);
@@ -1569,7 +1386,7 @@ mod tests {
 
     #[test]
     fn page_tlb_entry_rw_allows_w_rx_denies_w() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x52_0000, 0x1000, crate::perm::READ | crate::perm::WRITE)
             .expect("map RW");
         let e = mem.page_tlb_entry(page_key(0x52_0000)).expect("rw");
@@ -1583,7 +1400,7 @@ mod tests {
 
     #[test]
     fn page_tlb_entry_none_for_noaccess() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x51_0000, 0x1000, 0).expect("map NA");
         // perms 0 → PAGE_NOACCESS after map_with_type
         assert!(mem.page_tlb_entry(page_key(0x51_0000)).is_none());
@@ -1592,7 +1409,7 @@ mod tests {
     #[test]
     fn region_pin_requires_host_base_and_intersects_protect() {
         // Mmap backend fills host_base; uniform RW → full pin.
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         mem.map(0x2000_0000, 0x1_0000, crate::perm::ALL)
             .expect("map stack");
         mem.register_region(GuestRegion::new(
@@ -1628,8 +1445,8 @@ mod tests {
 
     #[test]
     fn region_pin_disabled_without_host_base() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
-        mem.map(0x2000_0000, 0x1000, crate::perm::ALL).expect("map");
+        // Register a named region without any covering arena → no pin.
+        let mut mem = GuestMemory::new();
         mem.register_region(GuestRegion::new(
             "stack",
             RegionKind::Stack,
@@ -1643,8 +1460,8 @@ mod tests {
     }
 
     #[test]
-    fn host_span_single_page_hash() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+    fn host_span_single_page() {
+        let mut mem = GuestMemory::new();
         // Pure RW data — host-span write allowed (not executable).
         mem.map(0x40_0000, 0x2000, crate::perm::READ | crate::perm::WRITE)
             .expect("map");
@@ -1664,7 +1481,7 @@ mod tests {
 
     #[test]
     fn host_span_multi_page_mmap() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         mem.map(0x50_0000, 0x3000, crate::perm::READ | crate::perm::WRITE)
             .expect("map");
         let len = 0x2000_usize;
@@ -1684,7 +1501,7 @@ mod tests {
 
     #[test]
     fn host_span_ro_write_denied() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         mem.map(0x60_0000, 0x1000, crate::perm::READ | crate::perm::WRITE)
             .expect("map");
         mem.virtual_protect(0x60_0000, 0x1000, protect::PAGE_READONLY)
@@ -1695,7 +1512,7 @@ mod tests {
 
     #[test]
     fn host_span_write_denied_on_executable() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x61_0000, 0x1000, crate::perm::ALL)
             .expect("map RWX");
         // Phase 4.x: no host-span write onto X pages (SMC via write + invalidate).
@@ -1705,7 +1522,7 @@ mod tests {
 
     #[test]
     fn region_pin_disabled_when_gap_in_range() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         // Two committed islands with a free hole between them.
         mem.map(0x3000_0000, 0x1000, crate::perm::ALL)
             .expect("map a");
@@ -1729,7 +1546,7 @@ mod tests {
 
     #[test]
     fn spc_rx_fetch_ok_write_fails() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x30_0000, 0x1000, crate::perm::READ | crate::perm::EXEC)
             .expect("map RX");
         // Seed bytes via backend would bypass SPC; map is zeroed — fetch still ok.
@@ -1741,14 +1558,14 @@ mod tests {
 
     #[test]
     fn spc_unmapped_fails() {
-        let mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mem = GuestMemory::new();
         let mut buf = [0_u8; 4];
         assert!(mem.read(0x40_0000, &mut buf).is_err());
     }
 
     #[test]
     fn spc_cross_page_all_or_nothing() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x50_0000, 0x1000, crate::perm::ALL)
             .expect("map one");
         // Write straddling into unmapped second page must not partial-write.
@@ -1760,27 +1577,21 @@ mod tests {
     }
 
     #[test]
-    fn spc_same_on_all_backends() {
-        for kind in [
-            MemBackendKind::Hash,
-            MemBackendKind::Mmap,
-            MemBackendKind::Hybrid,
-        ] {
-            let mut mem = GuestMemory::with_kind(kind);
-            mem.map(0x60_0000, 0x1000, crate::perm::READ).expect("map");
-            assert!(
-                mem.write(0x60_0000, &[1]).is_err(),
-                "backend {}",
-                mem.backend_name()
-            );
-            let mut b = [0_u8; 1];
-            mem.read(0x60_0000, &mut b).expect("read");
-        }
+    fn spc_readonly_on_mmap() {
+        let mut mem = GuestMemory::new();
+        mem.map(0x60_0000, 0x1000, crate::perm::READ).expect("map");
+        assert!(
+            mem.write(0x60_0000, &[1]).is_err(),
+            "backend {}",
+            mem.backend_name()
+        );
+        let mut b = [0_u8; 1];
+        mem.read(0x60_0000, &mut b).expect("read");
     }
 
     #[test]
     fn map_updates_pagemap_committed() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         mem.map(0x70_0000, 0x2000, crate::perm::ALL).expect("map");
         let run = mem.page_map().query_run(0x70_0000).expect("run");
         assert_eq!(run.state, PageState::Committed);
@@ -1790,7 +1601,7 @@ mod tests {
 
     #[test]
     fn virtual_alloc_reserve_commit_islands() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         let base = mem
             .virtual_alloc(0, 0x10_0000, MEM_RESERVE, protect::PAGE_READWRITE)
             .expect("reserve 1MiB");
@@ -1818,7 +1629,7 @@ mod tests {
 
     #[test]
     fn virtual_alloc_commit_without_reserve_fails() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         let err = mem
             .virtual_alloc(
                 0x0000_0002_0000_0000,
@@ -1832,7 +1643,7 @@ mod tests {
 
     #[test]
     fn virtual_alloc_recommit_ok() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         let base = mem
             .virtual_alloc(
                 0,
@@ -1851,7 +1662,7 @@ mod tests {
 
     #[test]
     fn virtual_free_release_rules() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hybrid);
+        let mut mem = GuestMemory::new();
         let base = mem
             .virtual_alloc(
                 0,
@@ -1868,7 +1679,7 @@ mod tests {
 
     #[test]
     fn virtual_free_decommit_middle() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         let base = mem
             .virtual_alloc(
                 0,
@@ -1890,7 +1701,7 @@ mod tests {
 
     #[test]
     fn virtual_protect_splits_query() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         let base = mem
             .virtual_alloc(
                 0,
@@ -1921,7 +1732,7 @@ mod tests {
 
     #[test]
     fn virtual_protect_reserved_fails() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         let base = mem
             .virtual_alloc(0, 0x1_0000, MEM_RESERVE, protect::PAGE_READWRITE)
             .expect("reserve");
@@ -1933,7 +1744,7 @@ mod tests {
 
     #[test]
     fn virtual_protect_cross_alloc_fails() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mut mem = GuestMemory::new();
         let a = mem
             .virtual_alloc(
                 0,
@@ -1962,7 +1773,7 @@ mod tests {
 
     #[test]
     fn virtual_query_free() {
-        let mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mem = GuestMemory::new();
         let mbi = mem.virtual_query(0x0000_0001_5000_0000);
         assert_eq!(mbi.state, MEM_FREE);
         assert_eq!(mbi.allocation_base, 0);
@@ -1972,7 +1783,7 @@ mod tests {
     #[test]
     fn checkerboard_spc_no_host_crash() {
         // Mixed RO/RW every 4K inside 64K — SPC enforces; process stays alive.
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         let base = mem
             .virtual_alloc(
                 0,
@@ -2000,7 +1811,7 @@ mod tests {
 
     #[test]
     fn phase7_high_va_mmap_roundtrip() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         // High canonical-ish guest VA (not low 4 GiB identity).
         let base = 0x0000_7fff_0000_0000_u64;
         mem.map(base, 0x2000, crate::perm::ALL).expect("map high");
@@ -2017,7 +1828,7 @@ mod tests {
 
     #[test]
     fn phase7_map_wraparound_rejected() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         // Page-aligned base near u64::MAX so `base + size` overflows.
         let base = u64::MAX - 0xfff;
         let aligned = base & !0xfff; // 0xffff_ffff_ffff_f000
@@ -2034,7 +1845,7 @@ mod tests {
     #[test]
     fn phase7_large_reserve_demand_zero_survives() {
         // >1 GiB RESERVE should not charge full RSS (anonymous demand-zero).
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let mut mem = GuestMemory::new();
         let base = 0x6000_0000_u64;
         let size = 0x4000_0000_usize; // 1 GiB
         let r = mem.virtual_alloc(base, size, MEM_RESERVE, protect::PAGE_READWRITE);
@@ -2062,37 +1873,26 @@ mod tests {
     }
 
     #[test]
-    fn phase7_anti_wine_soft_translate_all_backends() {
-        for kind in [
-            MemBackendKind::Hash,
-            MemBackendKind::Mmap,
-            MemBackendKind::Hybrid,
-        ] {
-            let mut mem = GuestMemory::with_kind(kind);
-            let guest = 0x1800_0000_u64;
-            mem.map(guest, 0x1_0000, crate::perm::ALL).expect("map");
-            if let Some(page) = mem.page_data_ptr(page_key(guest)) {
-                let host = u64::try_from(page.addr()).expect("host addr");
-                // Soft translate: host pointer is OS-chosen, never the guest VA.
-                assert_ne!(
-                    host, guest,
-                    "backend {} identity-mapped guest VA",
-                    mem.backend_name()
-                );
-            }
-            // Never reserve fixed low 4 GiB for identity — guest layout uses
-            // soft bases; host_base when present must differ from guest.
-            let name = mem.backend_name();
-            assert!(
-                matches!(name, "hash" | "mmap" | "hybrid"),
-                "unknown backend {name}"
+    fn phase7_anti_wine_soft_translate() {
+        let mut mem = GuestMemory::new();
+        let guest = 0x1800_0000_u64;
+        mem.map(guest, 0x1_0000, crate::perm::ALL).expect("map");
+        if let Some(page) = mem.page_data_ptr(page_key(guest)) {
+            let host = u64::try_from(page.addr()).expect("host addr");
+            // Soft translate: host pointer is OS-chosen, never the guest VA.
+            assert_ne!(
+                host,
+                guest,
+                "backend {} identity-mapped guest VA",
+                mem.backend_name()
             );
         }
+        assert_eq!(mem.backend_name(), "mmap");
     }
 
     #[test]
     fn phase7_virtual_alloc_size_overflow_rejected() {
-        let mut mem = GuestMemory::with_kind(MemBackendKind::Hybrid);
+        let mut mem = GuestMemory::new();
         let err = mem
             .virtual_alloc(
                 0x7000_0000,

@@ -17,8 +17,7 @@
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
-use wie_winapi::{WinApiId, resolve_winapi_id};
+use wie_winapi::{WinApiId, encode_alias};
 
 /// Must match `wie_winapi::guest_heap` size classes.
 const HEAP_SIZE_CLASS_COUNT: usize = 24;
@@ -57,8 +56,8 @@ impl GuestHeapAccelConfig {
             process_heap_handle: layout.process_heap_handle,
             alloc_impl_va: code,
             free_impl_va: code + 0x400,
-            alloc_fallback_va: layout.fake_api_base + 0xF200,
-            free_fallback_va: layout.fake_api_base + 0xF210,
+            alloc_fallback_va: encode_alias(WinApiId::Kernel32Heapalloc),
+            free_fallback_va: encode_alias(WinApiId::Kernel32Heapfree),
         }
     }
 }
@@ -66,8 +65,7 @@ impl GuestHeapAccelConfig {
 /// Install guest HeapAlloc/HeapFree helpers and rewire process-heap IAT entries.
 pub(crate) fn install_guest_heap_accel(
     engine: &mut dyn wie_cpu::CpuEngine,
-    entries: &mut Vec<RuntimeFakeApiEntry>,
-    by_va: &mut HashMap<u64, usize>,
+    entries: &[RuntimeFakeApiEntry],
     stop_bitmap: &mut [u8],
     layout: &RuntimeMemoryLayout,
 ) -> Result<GuestHeapAccelConfig> {
@@ -82,21 +80,6 @@ pub(crate) fn install_guest_heap_accel(
 
     write_heap_alloc_impl(engine, &config)?;
     write_heap_free_impl(engine, &config)?;
-
-    register_fallback(
-        entries,
-        by_va,
-        config.alloc_fallback_va,
-        "KERNEL32.dll",
-        "HeapAlloc",
-    );
-    register_fallback(
-        entries,
-        by_va,
-        config.free_fallback_va,
-        "KERNEL32.dll",
-        "HeapFree",
-    );
 
     // Default OFF for wall/CPU: host freelist is cheaper than dual guest path.
     // Opt in with WIE_GUEST_HEAP=1. Control block still planted for coherent host.
@@ -122,31 +105,6 @@ pub(crate) fn install_guest_heap_accel(
         "installed guest heap acceleration"
     );
     Ok(config)
-}
-
-fn register_fallback(
-    entries: &mut Vec<RuntimeFakeApiEntry>,
-    by_va: &mut HashMap<u64, usize>,
-    va: u64,
-    library: &str,
-    name: &str,
-) {
-    if by_va.contains_key(&va) {
-        return;
-    }
-    let winapi_id = resolve_winapi_id(library, name);
-    let mut traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
-    traits.set_noisy(true);
-    let index = entries.len();
-    entries.push(RuntimeFakeApiEntry {
-        fake_target_va: va,
-        library: library.into(),
-        name: name.into(),
-        iat_slot_va: 0,
-        winapi_id,
-        traits,
-    });
-    by_va.insert(va, index);
 }
 
 fn patch_rel32(code: &mut [u8], imm_at: usize, next_ip: usize, target: usize) {

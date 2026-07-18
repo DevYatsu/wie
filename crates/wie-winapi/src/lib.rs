@@ -9,6 +9,7 @@ pub mod comctl32;
 pub mod comdlg32;
 pub mod d3d9;
 pub mod dynamic_apis;
+pub mod fake_va;
 pub mod gdi32;
 pub mod guest_heap;
 pub mod guest_io_host;
@@ -21,6 +22,11 @@ pub mod user32;
 pub mod uxtheme;
 pub mod winmm;
 pub use bottle::{bottle_root_from_env, guest_path_to_host};
+pub use fake_va::{
+    COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
+    SPECIAL_CALLBACK_RETURN, callback_return_trampoline_va, decode as decode_fake_va,
+    encode_alias, encode_com, encode_export, encode_unresolved,
+};
 pub use guest_heap::GuestHeap;
 pub use idle::{IdleContext, IdlePolicy};
 pub use kernel32::WinApiHandlerResult;
@@ -658,7 +664,7 @@ pub enum WinApiControlSignal {
 mod dispatch_table;
 pub use dispatch_table::{
     WINAPI_ID_COUNT, WinApiId, WinApiTraits, dispatch_winapi, dispatch_winapi_id,
-    is_winapi_implemented, resolve_winapi_id,
+    is_winapi_implemented, resolve_winapi_id, winapi_id_export,
 };
 
 #[cfg(test)]

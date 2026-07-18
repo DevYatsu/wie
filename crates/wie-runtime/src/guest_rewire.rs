@@ -1,10 +1,11 @@
 //! Shared helpers: plant IAT jmp trampolines and clear stop-bitmap bits.
 //!
 //! Used by guest I/O / heap / MBWC accelerators so each module does not
-//! reimplement the same 8-argument rewire dance.
+//! reimplement the same rewire dance.
 
 use crate::hooks::RuntimeFakeApiEntry;
 use anyhow::{Context, Result};
+use wie_winapi::{encode_export, resolve_winapi_id};
 
 /// Context for rewriting one fake-API export to an in-guest implementation.
 pub(crate) struct FakeApiRewire<'a> {
@@ -16,18 +17,19 @@ pub(crate) struct FakeApiRewire<'a> {
 }
 
 impl FakeApiRewire<'_> {
-    /// Find `library!name` in the IAT table, plant `mov rax,imm64; jmp rax`, clear stop bits.
+    /// Plant `mov rax,imm64; jmp rax` at the dense fake VA for `library!name`.
     pub(crate) fn rewire(&mut self, library: &str, name: &str, target_va: u64) -> Result<()> {
-        let Some(entry) = self
-            .entries
-            .iter()
-            .find(|e| e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name))
-        else {
+        let from = if let Some(id) = resolve_winapi_id(library, name) {
+            encode_export(id)
+        } else if let Some(entry) = self.entries.iter().find(|e| {
+            e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name)
+        }) {
+            entry.fake_target_va
+        } else {
             tracing::debug!(library, name, "guest rewire: export not in IAT, skip");
             return Ok(());
         };
 
-        let from = entry.fake_target_va;
         plant_jmp_abs64(self.engine, from, target_va)?;
         // 12-byte absolute jmp: mark all bytes as guest passthrough.
         clear_stop_bits(

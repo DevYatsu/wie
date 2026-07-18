@@ -8,7 +8,6 @@
 
 use super::lower::JitCtx;
 use crate::mem::GuestMemory;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Which UCRT/CRT import to accelerate from JIT code.
@@ -78,8 +77,9 @@ pub struct JitHeapLayout {
 #[derive(Debug, Clone, Default)]
 pub struct JitFastPathConfig {
     pub heap: JitHeapLayout,
-    /// Fake-API guest VA → kind.
-    pub by_va: HashMap<u64, FastApiKind>,
+    /// Dense (VA, kind) pairs for UCRT fast paths — typically ≤ 8 entries.
+    /// Lookup is linear; cheaper than HashMap for this size and avoids stop tax.
+    pub pairs: Vec<(u64, FastApiKind)>,
 }
 
 // Process-wide heap layout for host helpers (set once per session).

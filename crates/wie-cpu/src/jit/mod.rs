@@ -28,7 +28,7 @@ pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 
 use crate::exec::{self, StepResult};
 use crate::iced_cpu::IcedCpu;
-use crate::mem::{self, protect, PAGE_SIZE, PAGE_SIZE_USIZE};
+use crate::mem::{self, PAGE_SIZE, PAGE_SIZE_USIZE, protect};
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
 use block::{BlockKind, decode_pure_gpr_block, pure_is_self_loop};
@@ -127,8 +127,8 @@ pub struct JitCpu {
     tlb_hot_gen: u64,
     /// Region-direct pins (rebuilt each `run_compiled` from layout + PageMap).
     pins: [MemPin; PIN_SLOTS],
-    /// Fake-API VA → fast UCRT kind (compile-time lookup).
-    fast_api: HashMap<u64, FastApiKind>,
+    /// Fake-API VA → fast UCRT kind (dense pairs; compile-time lookup).
+    fast_api: Vec<(u64, FastApiKind)>,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
     chain_va: Box<[u64; CHAIN_SLOTS]>,
     chain_fn: Box<[u64; CHAIN_SLOTS]>,
@@ -255,7 +255,7 @@ impl JitCpu {
             tlb_hot_prot: 0,
             tlb_hot_gen: 0,
             pins: [MemPin::EMPTY; PIN_SLOTS],
-            fast_api: HashMap::new(),
+            fast_api: Vec::new(),
             chain_va: Box::new([0; CHAIN_SLOTS]),
             chain_fn: Box::new([0; CHAIN_SLOTS]),
             edge_ic_va: [0; lower::EDGE_IC_SLOTS],
@@ -276,10 +276,17 @@ impl JitCpu {
     /// Install UCRT/heap fast-path config (called once after fake-API table build).
     pub fn configure_fast_path(&mut self, cfg: JitFastPathConfig) {
         install_heap_layout(cfg.heap);
-        self.fast_api = cfg.by_va;
+        self.fast_api = cfg.pairs;
         // New mappings invalidate prior compiles that missed the fast path.
         self.clear_compiled();
         self.invalidate_chain_and_shadow();
+    }
+
+    #[inline]
+    fn fast_api_kind(&self, va: u64) -> Option<FastApiKind> {
+        self.fast_api
+            .iter()
+            .find_map(|&(k, kind)| (k == va).then_some(kind))
     }
 
     /// Insert a Ready block and keep `chain_ids` + code-page index consistent.
@@ -545,7 +552,7 @@ impl JitCpu {
                 ..
             } => {
                 let final_va = resolve_thunk_va(&self.iced, target);
-                self.fast_api.contains_key(&final_va)
+                self.fast_api_kind(final_va).is_some()
             }
             _ => false,
         }
@@ -581,7 +588,12 @@ impl JitCpu {
                     self.stats.compiles = self.stats.compiles.saturating_add(1);
                     if jit_chain_enabled() {
                         let fn_ptr = compiled.func as usize as u64;
-                        chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), rip, fn_ptr);
+                        chain_table_insert(
+                            self.chain_va.as_mut(),
+                            self.chain_fn.as_mut(),
+                            rip,
+                            fn_ptr,
+                        );
                     }
                     tracing::debug!(
                         start = format_args!("{rip:#x}"),
@@ -595,7 +607,7 @@ impl JitCpu {
                 let call_fast = match term {
                     Some(block::BlockTerm::Call { target, .. }) => {
                         let final_va = resolve_thunk_va(&self.iced, target);
-                        self.fast_api.get(&final_va).copied()
+                        self.fast_api_kind(final_va)
                     }
                     _ => None,
                 };
@@ -670,10 +682,7 @@ impl JitCpu {
         // Safe even when IR pin path is off: helpers still use pin_resolve.
         {
             let infos = self.iced.guest_mem_mut().jit_region_pins();
-            self.pins = [
-                MemPin::from_info(infos[0]),
-                MemPin::from_info(infos[1]),
-            ];
+            self.pins = [MemPin::from_info(infos[0]), MemPin::from_info(infos[1])];
         }
         let mem_gen = self.iced.guest_mem_mut().generation();
         let mem_ptr = std::ptr::from_mut(self.iced.guest_mem_mut());
@@ -1201,12 +1210,7 @@ impl CpuEngine for JitCpu {
         r
     }
 
-    fn virtual_free(
-        &mut self,
-        addr: u64,
-        size: usize,
-        free_type: u32,
-    ) -> Result<(), CpuError> {
+    fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
         // Resolve the guest span before free (RELEASE uses allocation size).
         let inv_span = self.code_inv_span_for_free(addr, size, free_type);
         // Flush TLB before munmap so JIT never holds freed host pointers.

@@ -84,8 +84,9 @@ impl RuntimeMemoryLayout {
     #[must_use]
     pub const fn default() -> Self {
         Self {
-            fake_api_base: 0x0000_7000_0000_0000,
-            fake_api_size: 0x0001_0000,
+            // 4 MiB window: dense kind|payload encoding (see wie_winapi::fake_va).
+            fake_api_base: wie_winapi::FAKE_API_BASE,
+            fake_api_size: wie_winapi::FAKE_API_SIZE,
             process_heap_handle: 0x0000_0000_5000_0000,
             // Must not collide with common PE ImageBase values (0x400000 and
             // modern 0x140000000). Formerly 0x140000000 — broke micro-PEs on Unicorn.
@@ -104,29 +105,28 @@ impl RuntimeMemoryLayout {
             // pure guest spin cannot hang forever (no_hook_slice_limit).
             instruction_budget: 20_000_000,
             no_hook_slice_limit: 40,
-            fast_api_stub_base: 0x0000_7000_0001_0000,
+            // All guest helper regions sit after the 4 MiB fake-API window.
+            fast_api_stub_base: 0x0000_7000_0040_0000,
             fast_api_stub_size: 0x1000,
-            // Inside the 64 KiB fake-API page at `fake_api_base`.
-            callback_return_trampoline_va: 0x0000_7000_0000_0ff0,
-            // Outside the host-stop hook range (starts at fake_api_base + 64KiB).
-            guest_io_code_base: 0x0000_7000_0001_1000,
+            // Dense special VA (kind=Special, payload=callback).
+            callback_return_trampoline_va: wie_winapi::callback_return_trampoline_va(),
+            guest_io_code_base: 0x0000_7000_0040_1000,
             guest_io_code_size: 0x2000,
-            guest_io_table_base: 0x0000_7000_0002_0000,
+            guest_io_table_base: 0x0000_7000_0040_3000,
             guest_io_table_size: 0x2000,
             // Large arena after process heap for file content mirrors.
             guest_file_data_base: 0x0000_0001_5000_0000,
             guest_file_data_size: 0x0400_0000,
-            // Fiber-local storage value table for in-guest FlsGetValue.
-            guest_fls_table_base: 0x0000_7000_0003_0000,
+            guest_fls_table_base: 0x0000_7000_0040_5000,
             guest_fls_table_size: 0x1000,
-            guest_heap_ctrl_base: 0x0000_7000_0004_0000,
+            guest_heap_ctrl_base: 0x0000_7000_0040_6000,
             guest_heap_ctrl_size: 0x1000,
-            guest_heap_code_base: 0x0000_7000_0004_1000,
+            guest_heap_code_base: 0x0000_7000_0040_7000,
             guest_heap_code_size: 0x1000,
-            guest_mbwc_code_base: 0x0000_7000_0004_2000,
+            guest_mbwc_code_base: 0x0000_7000_0040_8000,
             guest_mbwc_code_size: 0x1000,
             // Metrics[256×u32] + colors[32×u32] + cwd wide blob.
-            guest_stub_data_base: 0x0000_7000_0004_3000,
+            guest_stub_data_base: 0x0000_7000_0040_9000,
             guest_stub_data_size: 0x2000,
         }
     }

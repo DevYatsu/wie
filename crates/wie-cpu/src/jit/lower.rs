@@ -10,7 +10,7 @@
 
 use super::JitEngine;
 use super::block::{
-    analyze_block_stack_pin, BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op,
+    BlockStackPinPlan, BlockTerm, DecodedInsn, analyze_block_stack_pin, is_string_op,
     mem_width_bytes, string_op_size,
 };
 use super::fast_api::{self, FastApiKind};
@@ -505,7 +505,11 @@ fn tlb_bucket_lookup_scalar(
         if bucket.tags.get(way).copied() != Some(page_key) {
             continue;
         }
-        let host = bucket.host.get(way).copied().unwrap_or(std::ptr::null_mut());
+        let host = bucket
+            .host
+            .get(way)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
         if host.is_null() {
             continue;
         }
@@ -544,7 +548,11 @@ fn tlb_bucket_lookup(
         if way >= TLB_WAYS_PER_SET {
             return None;
         }
-        let host = bucket.host.get(way).copied().unwrap_or(std::ptr::null_mut());
+        let host = bucket
+            .host
+            .get(way)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
         if host.is_null() {
             return None;
         }
@@ -714,8 +722,9 @@ pub(super) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) 
             let f = fns[i];
             if f != 0 {
                 // Install monomorphic edge IC (RR victim).
-                let slot = usize::try_from(ctx.edge_ic_rr % u64::try_from(EDGE_IC_SLOTS).unwrap_or(4))
-                    .unwrap_or(0);
+                let slot =
+                    usize::try_from(ctx.edge_ic_rr % u64::try_from(EDGE_IC_SLOTS).unwrap_or(4))
+                        .unwrap_or(0);
                 ctx.edge_ic_va[slot] = va;
                 ctx.edge_ic_fn[slot] = f;
                 ctx.edge_ic_rr = ctx.edge_ic_rr.wrapping_add(1);
@@ -1134,18 +1143,14 @@ pub(super) fn compile_block(
 
         // Dual path when the block is stack-pin-shaped: super (bare host mem) vs
         // normal (sticky/pin probes). One block-wide guard on entry.
-        let dual_super = stack_plan.is_some()
-            && stack_pin.is_some()
-            && !has_string
-            && call_fast.is_none();
+        let dual_super =
+            stack_plan.is_some() && stack_pin.is_some() && !has_string && call_fast.is_none();
 
         let mut headers_to_seal: Vec<Block> = Vec::new();
         // Tracks gpr_loaded for the exit store mask (union of paths; full when dual).
         let mut exit_gpr_loaded = entry_loaded;
 
-        if dual_super
-            && let (Some(plan), Some(spin)) = (stack_plan, stack_pin)
-        {
+        if dual_super && let (Some(plan), Some(spin)) = (stack_plan, stack_pin) {
             let base = entry_gpr[plan.base_idx];
             let guard = emit_block_wide_stack_guard(&mut bcx, &spin, base, &plan);
             let bias = bcx.ins().isub(spin.host_base, spin.guest_base);
@@ -1206,14 +1211,7 @@ pub(super) fn compile_block(
                 let mut xmm_loaded = [false; 16];
                 for (i, &is_live) in live_xmm.iter().enumerate() {
                     if is_live {
-                        load_xmm_pair(
-                            &mut bcx,
-                            ctx_ptr,
-                            flags,
-                            i,
-                            &mut xmm_vals,
-                            &mut xmm_loaded,
-                        );
+                        load_xmm_pair(&mut bcx, ctx_ptr, flags, i, &mut xmm_vals, &mut xmm_loaded);
                     }
                 }
 
@@ -1320,14 +1318,7 @@ pub(super) fn compile_block(
             let mut xmm_loaded = [false; 16];
             for (i, &is_live) in live_xmm.iter().enumerate() {
                 if is_live {
-                    load_xmm_pair(
-                        &mut bcx,
-                        ctx_ptr,
-                        flags,
-                        i,
-                        &mut xmm_vals,
-                        &mut xmm_loaded,
-                    );
+                    load_xmm_pair(&mut bcx, ctx_ptr, flags, i, &mut xmm_vals, &mut xmm_loaded);
                 }
             }
 
@@ -2060,7 +2051,12 @@ fn mark_xmm_dirty_ir(bcx: &mut FunctionBuilder<'_>, mem: &MemEnv, idx: usize) {
     bcx.ins().store(mem.flags, new, p, 0);
 }
 
-fn pair_to_i8x16(bcx: &mut FunctionBuilder<'_>, flags: MemFlagsData, lo: Value, hi: Value) -> Value {
+fn pair_to_i8x16(
+    bcx: &mut FunctionBuilder<'_>,
+    flags: MemFlagsData,
+    lo: Value,
+    hi: Value,
+) -> Value {
     let zero = iconst_u64(bcx, 0);
     let mut v = bcx.ins().splat(types::I64X2, zero);
     v = bcx.ins().insertlane(v, lo, 0);
@@ -3108,8 +3104,7 @@ fn try_lower_inline_rep(
     bcx.append_block_param(done, types::I64); // rdi
     bcx.append_block_param(done, types::I64); // rflags
 
-    bcx.ins()
-        .brif(eligible, cont_fast, &[], cont_slow, &[]);
+    bcx.ins().brif(eligible, cont_fast, &[], cont_slow, &[]);
 
     // ---- fast path ----
     bcx.switch_to_block(cont_fast);
@@ -3919,12 +3914,7 @@ fn emit_body_and_term(
         if is_string_op(&d.instr) {
             flush_pending(bcx, rflags_val, &mut pending);
             string_exit_rip = Some(lower_string(
-                bcx,
-                &d.instr,
-                gpr_vals,
-                rflags_val,
-                gpr_loaded,
-                mem_env,
+                bcx, &d.instr, gpr_vals, rflags_val, gpr_loaded, mem_env,
             )?);
         } else {
             lower_insn(
@@ -4019,15 +4009,7 @@ fn emit_body_and_term(
             if let BlockTerm::Call { return_ip, .. } = t {
                 shadow_push(bcx, ctx_ptr, flags, return_ip);
             }
-            let exit_rip = lower_term(
-                bcx,
-                t,
-                gpr_vals,
-                gpr_dirty,
-                *rflags_val,
-                mem_env,
-                term_ip,
-            )?;
+            let exit_rip = lower_term(bcx, t, gpr_vals, gpr_dirty, *rflags_val, mem_env, term_ip)?;
             let exit_rip = if matches!(t, BlockTerm::Ret) {
                 shadow_pop_check(bcx, ctx_ptr, flags, exit_rip)
             } else {
@@ -4152,9 +4134,7 @@ fn emit_block_wide_stack_guard(
     let lo = bcx.ins().iadd(base, min_d);
     let hi = bcx.ins().iadd(base, max_e);
     // Span must not wrap the address space.
-    let no_wrap = bcx
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, hi, lo);
+    let no_wrap = bcx.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, hi, lo);
     let lo_ok = bcx
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, lo, pin.guest_base);
@@ -4231,8 +4211,12 @@ fn hoisted_pin_probe(
     let size_v = iconst_u64(bcx, u64::from(size));
     let end = bcx.ins().iadd(addr, size_v);
     let no_wrap = bcx.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, end, addr);
-    let lo_ok = bcx.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, addr, pin.guest_base);
-    let hi_ok = bcx.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, pin.guest_end);
+    let lo_ok = bcx
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, addr, pin.guest_base);
+    let hi_ok = bcx
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, end, pin.guest_end);
     let need = if write { TLB_PROT_W } else { TLB_PROT_R };
     let need_v = iconst_u64(bcx, need);
     let prot_bits = bcx.ins().band(pin.allow, need_v);

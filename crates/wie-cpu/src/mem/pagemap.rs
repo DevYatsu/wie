@@ -140,12 +140,11 @@ impl PageMap {
         if len == 0 {
             return Ok(());
         }
-        let len_u64 = u64::try_from(len).map_err(|_| {
-            CpuError::Message(format!("access length {len} does not fit u64"))
-        })?;
-        let end = va.checked_add(len_u64).ok_or_else(|| {
-            CpuError::Message(format!("access overflow at {va:#x}+{len:#x}"))
-        })?;
+        let len_u64 = u64::try_from(len)
+            .map_err(|_| CpuError::Message(format!("access length {len} does not fit u64")))?;
+        let end = va
+            .checked_add(len_u64)
+            .ok_or_else(|| CpuError::Message(format!("access overflow at {va:#x}+{len:#x}")))?;
 
         let mut page = va >> PAGE_SHIFT;
         let last_page = end.saturating_sub(1) >> PAGE_SHIFT;
@@ -191,9 +190,8 @@ impl PageMap {
                 "pagemap set_range address {address:#x} not page-aligned"
             )));
         }
-        let size_u64 = u64::try_from(size).map_err(|_| {
-            CpuError::Message(format!("pagemap size {size} does not fit u64"))
-        })?;
+        let size_u64 = u64::try_from(size)
+            .map_err(|_| CpuError::Message(format!("pagemap size {size} does not fit u64")))?;
         if !size_u64.is_multiple_of(PAGE_SIZE) {
             return Err(CpuError::Message(format!(
                 "pagemap set_range size {size:#x} not page-aligned"
@@ -210,13 +208,7 @@ impl PageMap {
     }
 
     /// Core mutator on page-key half-open range `[start_page, end_page)`.
-    fn set_page_range(
-        &mut self,
-        start_page: u64,
-        end_page: u64,
-        state: PageState,
-        protect: u32,
-    ) {
+    fn set_page_range(&mut self, start_page: u64, end_page: u64, state: PageState, protect: u32) {
         if start_page >= end_page {
             return;
         }
@@ -369,15 +361,9 @@ mod tests {
         m.set_range(0x2000, 0x1000, PageState::Committed, PAGE_READONLY)
             .expect("mid");
         assert_eq!(m.run_count(), 3);
-        assert_eq!(
-            m.lookup(0x1000 >> 12).expect("l").protect,
-            PAGE_READWRITE
-        );
+        assert_eq!(m.lookup(0x1000 >> 12).expect("l").protect, PAGE_READWRITE);
         assert_eq!(m.lookup(0x2000 >> 12).expect("m").protect, PAGE_READONLY);
-        assert_eq!(
-            m.lookup(0x3000 >> 12).expect("r").protect,
-            PAGE_READWRITE
-        );
+        assert_eq!(m.lookup(0x3000 >> 12).expect("r").protect, PAGE_READWRITE);
     }
 
     #[test]
