@@ -164,6 +164,7 @@ Phases 0–5 landed; baselines and design notes:
 | [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md)     | Stack/heap pins + block-wide super path |
 | [`docs/phase4-jit-coherency.md`](docs/phase4-jit-coherency.md) | Chaining / edge IC / I$ policy          |
 | [`docs/phase4-string-bulk.md`](docs/phase4-string-bulk.md)     | REP MOVS/STOS host spans                |
+| [`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md) | Selective JIT drop on X-loss / SMC / free |
 | [`docs/phase5-guest-stubs.md`](docs/phase5-guest-stubs.md)     | In-guest WinAPI stubs (Learn policy)    |
 | [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md)         | Full plan (Phases 6–7 still open)       |
 
@@ -183,7 +184,7 @@ What actually burns CPU today:
 4. **Block entry/exit** — GPR sync is mandatory; XMM sync is skipped for pure GPR blocks.
 5. **Cold compile tax** — hotness threshold avoids compiling one-shot code; short micros spend most wall in session init.
 
-Further wins worth pursuing (roadmap): idle park for Sleep/message waits (Phase 6); TLB/JIT invalidation hardening + optional default flip to `WIE_MEM=mmap` (Phase 7); more Learn-correct guest stubs; denser stop/API lookup.
+Further wins worth pursuing (roadmap): idle park for Sleep/message waits (Phase 6); stress / cutover + optional default flip to `WIE_MEM=mmap` (Phase 7; core code invalidation is Phase 4.x); denser stop/API lookup.
 
 ## Installation & Prerequisites
 

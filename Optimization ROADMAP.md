@@ -168,6 +168,17 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 **DoD:** `cpu_string` green; host-span unit tests; no guest-VA into libc. ✅
 
+### 4.x Selective code invalidation (X-loss / SMC / VirtualProtect) ✅
+
+- **X-loss:** `VirtualProtect` with non-executable `new_protect` drops overlapping Ready blocks.
+- **SMC:** `GuestMemory::write` notes pending range; drained after compiled block / iced step → selective `invalidate_code_range`.
+- **No W on X:** sticky/TLB/pin/`host_span` write never soft-translate onto executable pages (forces slow path + note).
+- **Free/decommit:** invalidate code over freed span; edge IC cleared with chain on any drop.
+- **code_pages** index for O(1) data-write fast-reject.
+- Docs: [`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md).
+
+**DoD:** Unit tests S1–S6 green; micro-suite green; `long_loop` not regressed. ✅
+
 ---
 
 ## Phase 5 – Guest Stub Expansion ✅
@@ -231,7 +242,9 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 - Unify invalidation of TLB, JIT cache, and region table when memory protection changes or code is written.
 - Ensure stale host pointers are never used after `VirtualFree` or `Unmap`.
 
-**DoD:** Self‑modifying code and `VirtualProtect` tests pass.
+**Status:** Core rules landed in **Phase 4.x** ([`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md)): selective JIT drop on X-loss/SMC/free, no W soft-translate on X, edge IC clear. Phase 7 may still add stress / multi-region edge cases and optional `FlushInstructionCache` stub.
+
+**DoD:** Self‑modifying code and `VirtualProtect` tests pass. (4.x unit coverage done; broader stress remains.)
 
 ### 7.2 Stress Testing
 

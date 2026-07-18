@@ -55,8 +55,10 @@ miss → wie_jit_chain_lookup (table + install edge IC) → call_indirect or dis
 ## Interaction with memory generation / protect
 
 - Data writes that do **not** overlap compiled guest ranges leave the chain table and edge IC intact.
-- Code-overlapping guest writes drop compiled ranges and rebuild the chain table (edge IC cleared).
-- `VirtualProtect` / free / map bump `mem_gen` and invalidate TLB/pins; they do **not** by themselves require I-cache ops for host JIT code.
+- Code-overlapping guest writes drop compiled ranges, clear **edge IC + chain + shadow**, then rebuild the chain table from survivors.
+- `VirtualProtect` **X-loss** (`!allows_execute(new)`) selectively drops Ready blocks for the range (Phase 4.x).
+- `VirtualProtect` / free / map bump `mem_gen` and invalidate TLB/pins; they do **not** require I-cache ops for host JIT code.
+- Full rules: [`phase4-code-invalidation.md`](phase4-code-invalidation.md).
 
 ## Kill-switches / bisect
 

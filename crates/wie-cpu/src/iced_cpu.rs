@@ -101,6 +101,11 @@ impl IcedCpu {
         &mut self.mem
     }
 
+    /// Immutable guest memory (code invalidation span lookup, etc.).
+    pub(crate) fn guest_mem(&self) -> &GuestMemory {
+        &self.mem
+    }
+
     /// One step returning the raw [`StepResult`] (shared by `step_once` and JIT fallback).
     pub(crate) fn step_once_result(&mut self) -> Result<StepResult, CpuError> {
         self.push_rip_trace(self.regs.rip);

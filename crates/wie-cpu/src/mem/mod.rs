@@ -30,12 +30,13 @@ pub use hybrid::HybridBackend;
 pub use mmap_arena::MmapArenaBackend;
 pub use pagemap::{PageMap, PageRun, PageState};
 pub use region::{GuestRegion, RegionKind, RegionTable};
-pub use vad::{
-    align_down, align_up, win32_from_cpu_error, GUEST_ALLOC_GRANULARITY, MEM_COMMIT, MEM_DECOMMIT,
-    MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType, VadNode, VadTable,
-    ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
-};
 use vad::va_error;
+pub use vad::{
+    ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
+    GUEST_ALLOC_GRANULARITY, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE,
+    MEM_RELEASE, MEM_RESERVE, MemType, VadNode, VadTable, align_down, align_up,
+    win32_from_cpu_error,
+};
 
 /// `MEMORY_BASIC_INFORMATION` (x64 layout, 48 bytes) for `VirtualQuery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,7 +101,6 @@ impl MemBackendKind {
             _ => Self::Hybrid,
         }
     }
-
 }
 
 /// Concrete storage behind [`GuestMemory`].
@@ -267,6 +267,14 @@ pub(crate) struct GuestMemory {
     vad: VadTable,
     /// Bumped when protect/commit/release change; JIT flushes TLB on change (Phase 3+).
     generation: u64,
+    /// Guest **page keys** (`va >> 12`) touched by successful stores this slice.
+    ///
+    /// Phase 4.x: drained by `JitCpu` at safe points. Must **not** be a single
+    /// bounding-box range — CRT/stack+heap stores would span gigabytes of
+    /// empty pages and hang in `code_pages_overlap`.
+    pending_write_pages: Vec<u64>,
+    /// Set when too many distinct pages were written; drain does a full code flush.
+    pending_write_overflow: bool,
 }
 
 impl Default for GuestMemory {
@@ -303,6 +311,8 @@ impl GuestMemory {
             pages: PageMap::new(),
             vad: VadTable::new(),
             generation: 0,
+            pending_write_pages: Vec::new(),
+            pending_write_overflow: false,
         }
     }
 
@@ -319,6 +329,14 @@ impl GuestMemory {
     #[must_use]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Full VAD allocation span when `addr` is an allocation base (`MEM_RELEASE`).
+    #[must_use]
+    pub(crate) fn allocation_span_at_base(&self, addr: u64) -> Option<(u64, usize)> {
+        let node = self.vad.find_base(addr)?;
+        let size = usize::try_from(node.size).ok()?;
+        Some((node.allocation_base, size))
     }
 
     /// Software page map (tests / VirtualQuery plumbing).
@@ -386,7 +404,9 @@ impl GuestMemory {
                 return None;
             }
             allow_r &= protect::allows_read(run.protect);
-            allow_w &= protect::allows_write(run.protect);
+            // Phase 4.x: never soft-translate writes onto executable pages so
+            // SMC always hits `GuestMemory::write` + code-invalidate drain.
+            allow_w &= protect::allows_write(run.protect) && !protect::allows_execute(run.protect);
             saw = true;
             let next = run.end_page;
             if next <= page {
@@ -490,10 +510,7 @@ impl GuestMemory {
         new_protect: u32,
     ) -> Result<u32, crate::CpuError> {
         if size == 0 {
-            return Err(va_error(
-                ERROR_INVALID_PARAMETER,
-                "VirtualProtect size 0",
-            ));
+            return Err(va_error(ERROR_INVALID_PARAMETER, "VirtualProtect size 0"));
         }
         if !protect::is_supported_protect(new_protect) {
             return Err(va_error(
@@ -503,9 +520,11 @@ impl GuestMemory {
         }
         let page_base = align_down(addr, PAGE_SIZE);
         let end = addr
-            .checked_add(u64::try_from(size).map_err(|_| {
-                va_error(ERROR_INVALID_PARAMETER, "VirtualProtect size overflow")
-            })?)
+            .checked_add(
+                u64::try_from(size).map_err(|_| {
+                    va_error(ERROR_INVALID_PARAMETER, "VirtualProtect size overflow")
+                })?,
+            )
             .ok_or_else(|| va_error(ERROR_INVALID_PARAMETER, "VirtualProtect end overflow"))?;
         let page_end = align_up(end, PAGE_SIZE);
         let size_u64 = page_end.saturating_sub(page_base);
@@ -513,9 +532,10 @@ impl GuestMemory {
             .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "VirtualProtect size"))?;
 
         // Entire range must lie in one allocation and every page must be Committed.
-        let node = self.vad.find(page_base).ok_or_else(|| {
-            va_error(ERROR_INVALID_ADDRESS, "VirtualProtect outside allocation")
-        })?;
+        let node = self
+            .vad
+            .find(page_base)
+            .ok_or_else(|| va_error(ERROR_INVALID_ADDRESS, "VirtualProtect outside allocation"))?;
         if !node.contains_range(page_base, size_u64) {
             return Err(va_error(
                 ERROR_INVALID_ADDRESS,
@@ -620,9 +640,7 @@ impl GuestMemory {
         }
 
         let base_address = run_start.saturating_mul(PAGE_SIZE);
-        let region_size = run_end
-            .saturating_sub(run_start)
-            .saturating_mul(PAGE_SIZE);
+        let region_size = run_end.saturating_sub(run_start).saturating_mul(PAGE_SIZE);
         let (state, protect) = match run.state {
             PageState::Committed => (MEM_COMMIT, run.protect),
             PageState::Reserved => (MEM_RESERVE, 0),
@@ -874,9 +892,8 @@ impl GuestMemory {
             // Host RW; SPC uses Reserved so guest cannot touch until commit.
             self.backend.map(base, size_usize, crate::perm::ALL)?;
         }
-        let size_usize = usize::try_from(size_u64).map_err(|_| {
-            va_error(ERROR_NOT_ENOUGH_MEMORY, "reserve size does not fit usize")
-        })?;
+        let size_usize = usize::try_from(size_u64)
+            .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "reserve size does not fit usize"))?;
         self.pages.set_range(
             base,
             size_usize,
@@ -902,9 +919,8 @@ impl GuestMemory {
     ) -> Result<u64, crate::CpuError> {
         let (base, size_u64) = self.align_reserve_request(addr, size)?;
         self.ensure_pages_free(base, size_u64)?;
-        let size_usize = usize::try_from(size_u64).map_err(|_| {
-            va_error(ERROR_NOT_ENOUGH_MEMORY, "alloc size does not fit usize")
-        })?;
+        let size_usize = usize::try_from(size_u64)
+            .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "alloc size does not fit usize"))?;
         // Host storage for full span (all backends).
         self.backend
             .map(base, size_usize, protect::rwx_from_page_protect(protect))?;
@@ -936,9 +952,10 @@ impl GuestMemory {
         }
         let page_base = align_down(addr, PAGE_SIZE);
         let end = addr
-            .checked_add(u64::try_from(size).map_err(|_| {
-                va_error(ERROR_INVALID_PARAMETER, "commit size overflow")
-            })?)
+            .checked_add(
+                u64::try_from(size)
+                    .map_err(|_| va_error(ERROR_INVALID_PARAMETER, "commit size overflow"))?,
+            )
             .ok_or_else(|| va_error(ERROR_INVALID_PARAMETER, "commit end overflow"))?;
         let page_end = align_up(end, PAGE_SIZE);
         let size_u64 = page_end.saturating_sub(page_base);
@@ -987,8 +1004,11 @@ impl GuestMemory {
         if matches!(self.backend, Storage::Hash(_))
             || self.backend.page_data_ptr_walk(page_base >> 12).is_none()
         {
-            self.backend
-                .map(page_base, size_usize, protect::rwx_from_page_protect(protect))?;
+            self.backend.map(
+                page_base,
+                size_usize,
+                protect::rwx_from_page_protect(protect),
+            )?;
         }
         self.pages
             .set_range(page_base, size_usize, PageState::Committed, protect)?;
@@ -1005,18 +1025,20 @@ impl GuestMemory {
         }
         let page_base = align_down(addr, PAGE_SIZE);
         let end = addr
-            .checked_add(u64::try_from(size).map_err(|_| {
-                va_error(ERROR_INVALID_PARAMETER, "decommit size")
-            })?)
+            .checked_add(
+                u64::try_from(size)
+                    .map_err(|_| va_error(ERROR_INVALID_PARAMETER, "decommit size"))?,
+            )
             .ok_or_else(|| va_error(ERROR_INVALID_PARAMETER, "decommit overflow"))?;
         let page_end = align_up(end, PAGE_SIZE);
         let size_u64 = page_end.saturating_sub(page_base);
         let size_usize = usize::try_from(size_u64)
             .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "decommit size"))?;
 
-        let node = self.vad.find(page_base).ok_or_else(|| {
-            va_error(ERROR_INVALID_ADDRESS, "DECOMMIT outside allocation")
-        })?;
+        let node = self
+            .vad
+            .find(page_base)
+            .ok_or_else(|| va_error(ERROR_INVALID_ADDRESS, "DECOMMIT outside allocation"))?;
         if !node.contains_range(page_base, size_u64) {
             return Err(va_error(
                 ERROR_INVALID_ADDRESS,
@@ -1034,10 +1056,7 @@ impl GuestMemory {
                 {
                     let next = run.end_page.min(last);
                     if next <= page {
-                        return Err(va_error(
-                            ERROR_INVALID_ADDRESS,
-                            "DECOMMIT corrupt pagemap",
-                        ));
+                        return Err(va_error(ERROR_INVALID_ADDRESS, "DECOMMIT corrupt pagemap"));
                     }
                     page = next;
                 }
@@ -1062,11 +1081,10 @@ impl GuestMemory {
     }
 
     fn va_release(&mut self, addr: u64) -> Result<(), crate::CpuError> {
-        let node = self
-            .vad
-            .find_base(addr)
-            .cloned()
-            .ok_or_else(|| va_error(ERROR_INVALID_ADDRESS, "MEM_RELEASE not allocation base"))?;
+        let node =
+            self.vad.find_base(addr).cloned().ok_or_else(|| {
+                va_error(ERROR_INVALID_ADDRESS, "MEM_RELEASE not allocation base")
+            })?;
         let size_usize = usize::try_from(node.size)
             .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "release size"))?;
         // Flush software state first conceptually; drop host after (Drop munmap).
@@ -1083,11 +1101,7 @@ impl GuestMemory {
         Ok(())
     }
 
-    fn align_reserve_request(
-        &self,
-        addr: u64,
-        size: usize,
-    ) -> Result<(u64, u64), crate::CpuError> {
+    fn align_reserve_request(&self, addr: u64, size: usize) -> Result<(u64, u64), crate::CpuError> {
         let size_u64 = u64::try_from(size)
             .map_err(|_| va_error(ERROR_INVALID_PARAMETER, "size does not fit u64"))?;
         if addr == 0 {
@@ -1098,9 +1112,7 @@ impl GuestMemory {
             let base = self
                 .vad
                 .find_free_region(rounded, &|page| self.pages.lookup(page).is_some())
-                .ok_or_else(|| {
-                    va_error(ERROR_NOT_ENOUGH_MEMORY, "no free guest VA for reserve")
-                })?;
+                .ok_or_else(|| va_error(ERROR_NOT_ENOUGH_MEMORY, "no free guest VA for reserve"))?;
             return Ok((base, rounded));
         }
         let base = align_down(addr, GUEST_ALLOC_GRANULARITY);
@@ -1137,10 +1149,7 @@ impl GuestMemory {
             page = page.saturating_add(1);
         }
         if self.vad.overlaps(base, size) {
-            return Err(va_error(
-                ERROR_INVALID_ADDRESS,
-                "reserve over existing VAD",
-            ));
+            return Err(va_error(ERROR_INVALID_ADDRESS, "reserve over existing VAD"));
         }
         Ok(())
     }
@@ -1149,7 +1158,52 @@ impl GuestMemory {
     pub(crate) fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), crate::CpuError> {
         self.pages
             .check_access(address, bytes.len(), protect::AccessKind::Write)?;
-        self.backend.write(address, bytes)
+        self.backend.write(address, bytes)?;
+        // Record for Phase 4.x selective JIT invalidation (drained by JitCpu).
+        self.note_code_write(address, bytes.len());
+        Ok(())
+    }
+
+    /// Cap on recorded store pages per drain window (overflow → full code flush).
+    const PENDING_WRITE_PAGE_CAP: usize = 256;
+
+    /// Record pages touched by a successful guest store for Phase 4.x code inv.
+    #[inline]
+    pub(crate) fn note_code_write(&mut self, address: u64, len: usize) {
+        if len == 0 || self.pending_write_overflow {
+            return;
+        }
+        let len_u = u64::try_from(len).unwrap_or(u64::MAX);
+        let end = address.saturating_add(len_u);
+        if end <= address && len > 0 {
+            // Wrap / enormous: force full flush on drain.
+            self.pending_write_overflow = true;
+            self.pending_write_pages.clear();
+            return;
+        }
+        let mut page = address >> backend::PAGE_SHIFT;
+        let last = end.saturating_sub(1) >> backend::PAGE_SHIFT;
+        while page <= last {
+            if self.pending_write_pages.len() >= Self::PENDING_WRITE_PAGE_CAP {
+                self.pending_write_overflow = true;
+                self.pending_write_pages.clear();
+                return;
+            }
+            // Dedup last page (common sequential stores); full unique set not required.
+            if self.pending_write_pages.last().copied() != Some(page) {
+                self.pending_write_pages.push(page);
+            }
+            page = page.saturating_add(1);
+        }
+    }
+
+    /// Take pending store pages. `overflow == true` → caller should full-flush code.
+    #[inline]
+    pub(crate) fn take_pending_code_writes(&mut self) -> (Vec<u64>, bool) {
+        let overflow = self.pending_write_overflow;
+        self.pending_write_overflow = false;
+        let pages = std::mem::take(&mut self.pending_write_pages);
+        (pages, overflow)
     }
 
     /// Read into `bytes` from guest `address` after SPC (read permission).
@@ -1172,12 +1226,7 @@ impl GuestMemory {
     /// On success, the returned pointer is valid for `len` bytes for the lifetime
     /// of this `GuestMemory` borrow (and until the covering arena is released).
     #[must_use]
-    pub(crate) fn host_span(
-        &self,
-        address: u64,
-        len: usize,
-        write: bool,
-    ) -> Option<*mut u8> {
+    pub(crate) fn host_span(&self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
         if len == 0 {
             return None;
         }
@@ -1189,6 +1238,12 @@ impl GuestMemory {
             protect::AccessKind::Read
         };
         self.pages.check_access(address, len, kind).ok()?;
+
+        // Phase 4.x: never host-span *write* onto executable pages (SMC must
+        // go through `write` + code-invalidate). Reads of RX code are fine.
+        if write && self.range_allows_execute(address, len) {
+            return None;
+        }
 
         let page_off = usize::try_from(address & (backend::PAGE_SIZE - 1)).ok()?;
         // Single-page: any backend (hash page or arena page).
@@ -1207,7 +1262,9 @@ impl GuestMemory {
 
         // Multi-page: require one contiguous mmap arena covering [address, end).
         let guest_base = self.backend.arena_guest_base_for_va(address)?;
-        let guest_base_last = self.backend.arena_guest_base_for_va(end.saturating_sub(1))?;
+        let guest_base_last = self
+            .backend
+            .arena_guest_base_for_va(end.saturating_sub(1))?;
         if guest_base != guest_base_last {
             return None;
         }
@@ -1309,13 +1366,45 @@ impl GuestMemory {
             return None;
         }
         let allow_r = protect::allows_read(run.protect);
-        let allow_w = protect::allows_write(run.protect);
         let allow_x = protect::allows_execute(run.protect);
+        // Phase 4.x: W soft-translate is denied on executable pages so stores
+        // cannot silently SMC under sticky/pin/TLB without `GuestMemory::write`.
+        let allow_w = protect::allows_write(run.protect) && !allow_x;
         // NOACCESS / no usable rights → no TLB entry.
+        // Keep RX pages installable for data reads (allow_r).
         if !allow_r && !allow_w && !allow_x {
             return None;
         }
         Some(PageProtectMeta { allow_r, allow_w })
+    }
+
+    /// True if any committed page in `[address, address+len)` allows execute.
+    #[must_use]
+    fn range_allows_execute(&self, address: u64, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let Some(end) = address.checked_add(u64::try_from(len).unwrap_or(u64::MAX)) else {
+            return true;
+        };
+        let mut page = address >> backend::PAGE_SHIFT;
+        let last = end.saturating_sub(1) >> backend::PAGE_SHIFT;
+        while page <= last {
+            if let Some(run) = self.pages.lookup(page) {
+                if run.state == PageState::Committed && protect::allows_execute(run.protect) {
+                    return true;
+                }
+                let next = run.end_page;
+                if next <= page {
+                    page = page.saturating_add(1);
+                } else {
+                    page = next;
+                }
+            } else {
+                page = page.saturating_add(1);
+            }
+        }
+        false
     }
 }
 
@@ -1363,8 +1452,8 @@ struct PageProtectMeta {
 mod tests {
     use super::*;
     use super::{
-        win32_from_cpu_error, ERROR_INVALID_ADDRESS, GUEST_ALLOC_GRANULARITY, MEM_COMMIT,
-        MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE,
+        ERROR_INVALID_ADDRESS, GUEST_ALLOC_GRANULARITY, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE,
+        MEM_RESERVE, win32_from_cpu_error,
     };
 
     #[test]
@@ -1441,7 +1530,8 @@ mod tests {
     #[test]
     fn spc_readonly_write_fails_read_ok() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
-        mem.map(0x20_0000, 0x1000, crate::perm::READ).expect("map RO");
+        mem.map(0x20_0000, 0x1000, crate::perm::READ)
+            .expect("map RO");
         let mut buf = [0_u8; 4];
         mem.read(0x20_0000, &mut buf).expect("read ok");
         assert!(mem.write(0x20_0000, &[1, 2, 3, 4]).is_err());
@@ -1453,10 +1543,12 @@ mod tests {
     #[test]
     fn page_tlb_entry_tags_ro_and_bumps_gen_on_protect() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
-        mem.map(0x50_0000, 0x1000, crate::perm::ALL).expect("map RWX");
+        mem.map(0x50_0000, 0x1000, crate::perm::ALL)
+            .expect("map RWX");
         let k = page_key(0x50_0000);
         let e0 = mem.page_tlb_entry(k).expect("tlb entry");
-        assert!(e0.allow_r && e0.allow_w);
+        // Phase 4.x: RWX → soft-translate R only (no W on X).
+        assert!(e0.allow_r && !e0.allow_w);
         let g0 = e0.generation;
         assert!(g0 >= 1);
 
@@ -1474,6 +1566,20 @@ mod tests {
     }
 
     #[test]
+    fn page_tlb_entry_rw_allows_w_rx_denies_w() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        mem.map(0x52_0000, 0x1000, crate::perm::READ | crate::perm::WRITE)
+            .expect("map RW");
+        let e = mem.page_tlb_entry(page_key(0x52_0000)).expect("rw");
+        assert!(e.allow_r && e.allow_w);
+
+        mem.map(0x53_0000, 0x1000, crate::perm::READ | crate::perm::EXEC)
+            .expect("map RX");
+        let e2 = mem.page_tlb_entry(page_key(0x53_0000)).expect("rx");
+        assert!(e2.allow_r && !e2.allow_w);
+    }
+
+    #[test]
     fn page_tlb_entry_none_for_noaccess() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
         mem.map(0x51_0000, 0x1000, 0).expect("map NA");
@@ -1485,7 +1591,8 @@ mod tests {
     fn region_pin_requires_host_base_and_intersects_protect() {
         // Mmap backend fills host_base; uniform RW → full pin.
         let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
-        mem.map(0x2000_0000, 0x1_0000, crate::perm::ALL).expect("map stack");
+        mem.map(0x2000_0000, 0x1_0000, crate::perm::ALL)
+            .expect("map stack");
         mem.register_region(GuestRegion::new(
             "stack",
             RegionKind::Stack,
@@ -1494,11 +1601,19 @@ mod tests {
             crate::perm::ALL,
         ));
         let r = mem.find_region(0x2000_0800).expect("region").clone();
+        // Map used ALL (RWX) — Phase 4.x: pin is R-only when any page is X.
         let pin = mem.region_pin(&r).expect("pin");
         assert_eq!(pin.guest_base, 0x2000_0000);
         assert_eq!(pin.guest_end, 0x2001_0000);
         assert!(!pin.host_base.is_null());
-        assert!(pin.allow_r && pin.allow_w);
+        assert!(pin.allow_r);
+        assert!(!pin.allow_w);
+
+        // Pure RW stack: W soft-translate allowed.
+        mem.virtual_protect(0x2000_0000, 0x1_0000, protect::PAGE_READWRITE)
+            .expect("protect whole stack RW");
+        let pin_rw = mem.region_pin(&r).expect("pin RW");
+        assert!(pin_rw.allow_r && pin_rw.allow_w);
 
         // Mixed protect: one RO page → allow_w false (conservative).
         mem.virtual_protect(0x2000_1000, 0x1000, protect::PAGE_READONLY)
@@ -1528,7 +1643,9 @@ mod tests {
     #[test]
     fn host_span_single_page_hash() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
-        mem.map(0x40_0000, 0x2000, crate::perm::ALL).expect("map");
+        // Pure RW data — host-span write allowed (not executable).
+        mem.map(0x40_0000, 0x2000, crate::perm::READ | crate::perm::WRITE)
+            .expect("map");
         let p = mem
             .host_span(0x40_0100, 64, true)
             .expect("single-page host span");
@@ -1546,7 +1663,8 @@ mod tests {
     #[test]
     fn host_span_multi_page_mmap() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
-        mem.map(0x50_0000, 0x3000, crate::perm::ALL).expect("map");
+        mem.map(0x50_0000, 0x3000, crate::perm::READ | crate::perm::WRITE)
+            .expect("map");
         let len = 0x2000_usize;
         let p = mem
             .host_span(0x50_0800, len, true)
@@ -1565,7 +1683,8 @@ mod tests {
     #[test]
     fn host_span_ro_write_denied() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
-        mem.map(0x60_0000, 0x1000, crate::perm::ALL).expect("map");
+        mem.map(0x60_0000, 0x1000, crate::perm::READ | crate::perm::WRITE)
+            .expect("map");
         mem.virtual_protect(0x60_0000, 0x1000, protect::PAGE_READONLY)
             .expect("ro");
         assert!(mem.host_span(0x60_0000, 32, true).is_none());
@@ -1573,11 +1692,23 @@ mod tests {
     }
 
     #[test]
+    fn host_span_write_denied_on_executable() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        mem.map(0x61_0000, 0x1000, crate::perm::ALL)
+            .expect("map RWX");
+        // Phase 4.x: no host-span write onto X pages (SMC via write + invalidate).
+        assert!(mem.host_span(0x61_0000, 16, true).is_none());
+        assert!(mem.host_span(0x61_0000, 16, false).is_some());
+    }
+
+    #[test]
     fn region_pin_disabled_when_gap_in_range() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
         // Two committed islands with a free hole between them.
-        mem.map(0x3000_0000, 0x1000, crate::perm::ALL).expect("map a");
-        mem.map(0x3000_2000, 0x1000, crate::perm::ALL).expect("map b");
+        mem.map(0x3000_0000, 0x1000, crate::perm::ALL)
+            .expect("map a");
+        mem.map(0x3000_2000, 0x1000, crate::perm::ALL)
+            .expect("map b");
         // Register a region that claims the hole too (host_base from first arena).
         mem.register_region(GuestRegion::new(
             "span",
@@ -1597,12 +1728,8 @@ mod tests {
     #[test]
     fn spc_rx_fetch_ok_write_fails() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
-        mem.map(
-            0x30_0000,
-            0x1000,
-            crate::perm::READ | crate::perm::EXEC,
-        )
-        .expect("map RX");
+        mem.map(0x30_0000, 0x1000, crate::perm::READ | crate::perm::EXEC)
+            .expect("map RX");
         // Seed bytes via backend would bypass SPC; map is zeroed — fetch still ok.
         let mut out = [0_u8; 15];
         let n = mem.fetch_into(0x30_0000, &mut out).expect("fetch");
@@ -1620,7 +1747,8 @@ mod tests {
     #[test]
     fn spc_cross_page_all_or_nothing() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
-        mem.map(0x50_0000, 0x1000, crate::perm::ALL).expect("map one");
+        mem.map(0x50_0000, 0x1000, crate::perm::ALL)
+            .expect("map one");
         // Write straddling into unmapped second page must not partial-write.
         let payload = [0xAAu8; 8];
         assert!(mem.write(0x50_0ffc, &payload).is_err());
@@ -1654,10 +1782,7 @@ mod tests {
         mem.map(0x70_0000, 0x2000, crate::perm::ALL).expect("map");
         let run = mem.page_map().query_run(0x70_0000).expect("run");
         assert_eq!(run.state, PageState::Committed);
-        assert_eq!(
-            run.protect,
-            protect::PAGE_EXECUTE_READWRITE
-        );
+        assert_eq!(run.protect, protect::PAGE_EXECUTE_READWRITE);
         assert!(mem.generation() >= 1);
     }
 
@@ -1665,12 +1790,7 @@ mod tests {
     fn virtual_alloc_reserve_commit_islands() {
         let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
         let base = mem
-            .virtual_alloc(
-                0,
-                0x10_0000,
-                MEM_RESERVE,
-                protect::PAGE_READWRITE,
-            )
+            .virtual_alloc(0, 0x10_0000, MEM_RESERVE, protect::PAGE_READWRITE)
             .expect("reserve 1MiB");
         assert!(base.is_multiple_of(GUEST_ALLOC_GRANULARITY));
         // Reserved: no guest access.
@@ -1705,10 +1825,7 @@ mod tests {
                 protect::PAGE_READWRITE,
             )
             .expect_err("no reserve");
-        assert_eq!(
-            win32_from_cpu_error(&err),
-            Some(ERROR_INVALID_ADDRESS)
-        );
+        assert_eq!(win32_from_cpu_error(&err), Some(ERROR_INVALID_ADDRESS));
     }
 
     #[test]
@@ -1741,12 +1858,8 @@ mod tests {
                 protect::PAGE_READWRITE,
             )
             .expect("alloc");
-        assert!(mem
-            .virtual_free(base, 0x1000, MEM_RELEASE)
-            .is_err());
-        assert!(mem
-            .virtual_free(base + 0x1000, 0, MEM_RELEASE)
-            .is_err());
+        assert!(mem.virtual_free(base, 0x1000, MEM_RELEASE).is_err());
+        assert!(mem.virtual_free(base + 0x1000, 0, MEM_RELEASE).is_err());
         mem.virtual_free(base, 0, MEM_RELEASE).expect("release");
         assert!(mem.read(base, &mut [0_u8; 1]).is_err());
     }
@@ -1794,10 +1907,7 @@ mod tests {
         assert_eq!(mid.region_size, 0x1000);
         assert_eq!(mid.allocation_base, base);
         // Neighbours still RW.
-        assert_eq!(
-            mem.virtual_query(base).protect,
-            protect::PAGE_READWRITE
-        );
+        assert_eq!(mem.virtual_query(base).protect, protect::PAGE_READWRITE);
         assert_eq!(
             mem.virtual_query(base + 0x2000).protect,
             protect::PAGE_READWRITE
@@ -1813,9 +1923,10 @@ mod tests {
         let base = mem
             .virtual_alloc(0, 0x1_0000, MEM_RESERVE, protect::PAGE_READWRITE)
             .expect("reserve");
-        assert!(mem
-            .virtual_protect(base, 0x1000, protect::PAGE_READONLY)
-            .is_err());
+        assert!(
+            mem.virtual_protect(base, 0x1000, protect::PAGE_READONLY)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1841,9 +1952,10 @@ mod tests {
         // Range from end of a into b — must fail entirely.
         let span = b.saturating_sub(a).saturating_add(0x1000);
         let size = usize::try_from(span).expect("size");
-        assert!(mem
-            .virtual_protect(a, size, protect::PAGE_READONLY)
-            .is_err());
+        assert!(
+            mem.virtual_protect(a, size, protect::PAGE_READONLY)
+                .is_err()
+        );
     }
 
     #[test]

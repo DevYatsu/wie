@@ -92,4 +92,6 @@ WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh
 
 ## Phase 4 freeze
 
-Mechanisms for pins / chaining / REP bulk are in place. **Next:** 4.x selective code invalidation on `VirtualProtect` X-loss / SMC so pin + JIT code stay coherent on real software (see plan risk 3).
+Mechanisms for pins / chaining / REP bulk are in place.
+
+**4.x** ✅ Selective code invalidation — X-loss / SMC / free + **no W soft-translate on executable pages** (forces code stores through `GuestMemory::write` + pending drain). See [`phase4-code-invalidation.md`](phase4-code-invalidation.md).

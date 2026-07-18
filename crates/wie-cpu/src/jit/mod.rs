@@ -28,6 +28,7 @@ pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 
 use crate::exec::{self, StepResult};
 use crate::iced_cpu::IcedCpu;
+use crate::mem::{self, protect, PAGE_SIZE, PAGE_SIZE_USIZE};
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
 use block::{BlockKind, decode_pure_gpr_block, pure_is_self_loop};
@@ -140,6 +141,9 @@ pub struct JitCpu {
     /// Shadow return-stack depth across block entries (persisted in `run_compiled`).
     shadow_sp: u64,
     shadow_ret: [u64; lower::SHADOW_DEPTH],
+    /// Phase 4.x: guest page keys (`va >> 12`) covered by at least one Ready block.
+    /// Refcount = number of Ready blocks spanning that page (overlapping blocks).
+    code_pages: HashMap<u64, u32>,
 }
 
 enum CacheEntry {
@@ -218,6 +222,8 @@ pub struct JitStats {
     pub load_calls: u64,
     /// Calls into host `wie_jit_store` (TLB hit or miss).
     pub store_calls: u64,
+    /// Phase 4.x: selective code-cache invalidations (SMC / X-loss / unmap).
+    pub code_invs: u64,
 }
 
 impl JitCpu {
@@ -260,6 +266,7 @@ impl JitCpu {
             edge_ic_rr: 0,
             shadow_sp: 0,
             shadow_ret: [0; lower::SHADOW_DEPTH],
+            code_pages: HashMap::new(),
         }
     }
 
@@ -274,20 +281,22 @@ impl JitCpu {
         install_heap_layout(cfg.heap);
         self.fast_api = cfg.by_va;
         // New mappings invalidate prior compiles that missed the fast path.
-        if !self.cache.is_empty() {
-            self.cache.clear();
-            self.chain_ids.clear();
-        }
+        self.clear_compiled();
         self.invalidate_chain_and_shadow();
     }
 
-    /// Insert a Ready block and keep `chain_ids` consistent.
+    /// Insert a Ready block and keep `chain_ids` + code-page index consistent.
     fn insert_ready(&mut self, rip: u64, compiled: CompiledBlock) {
+        if let Some(CacheEntry::Ready(old)) = self.cache.remove(&rip) {
+            self.code_pages_remove_range(old.guest_start, old.guest_end);
+            self.chain_ids.remove(&rip);
+        }
         if jit_chain_enabled()
             && let Some(fid) = compiled.func_id
         {
             self.chain_ids.insert(rip, fid);
         }
+        self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
         self.cache.insert(rip, CacheEntry::Ready(compiled));
     }
 
@@ -295,12 +304,19 @@ impl JitCpu {
     fn clear_compiled(&mut self) {
         self.cache.clear();
         self.chain_ids.clear();
+        self.code_pages.clear();
     }
 
-    /// Drop only Ready blocks whose guest code range overlaps `[addr, addr+len)`.
-    /// Data writes that miss all compiled ranges leave the cache intact.
-    fn invalidate_compiled_overlapping(&mut self, addr: u64, len: usize) {
+    /// Phase 4.x: drop Ready blocks whose guest code range overlaps `[addr, addr+len)`.
+    ///
+    /// Also clears **edge IC** + chain table + shadow, then rebuilds the chain
+    /// from survivors. Data writes that miss the code-page index are a no-op.
+    fn invalidate_code_range(&mut self, addr: u64, len: usize) {
         if self.cache.is_empty() || len == 0 {
+            return;
+        }
+        // Fast reject: no Ready block covers any page in the write range.
+        if !self.code_pages_overlap(addr, len) {
             return;
         }
         let write_end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
@@ -317,15 +333,17 @@ impl JitCpu {
             })
             .collect();
         if to_drop.is_empty() {
-            // Data-only write: page buffers are updated in place; TLB stays valid.
             return;
         }
         for va in &to_drop {
-            self.cache.remove(va);
+            if let Some(CacheEntry::Ready(c)) = self.cache.remove(va) {
+                self.code_pages_remove_range(c.guest_start, c.guest_end);
+            }
             self.chain_ids.remove(va);
         }
-        // Rebuild late-bound chain from remaining Ready entries.
-        chain_table_clear(self.chain_va.as_mut(), self.chain_fn.as_mut());
+        self.stats.code_invs = self.stats.code_invs.saturating_add(1);
+        // Drop chain + edge IC + shadow; rebuild chain from remaining Ready.
+        self.invalidate_chain_and_shadow();
         if jit_chain_enabled() {
             for (va, entry) in &self.cache {
                 if let CacheEntry::Ready(c) = entry {
@@ -334,9 +352,114 @@ impl JitCpu {
                 }
             }
         }
-        // Code bytes changed under a previously compiled region — drop shadow.
-        self.shadow_sp = 0;
-        self.shadow_ret = [0; lower::SHADOW_DEPTH];
+    }
+
+    /// True if any guest page in `[addr, addr+len)` is covered by a Ready block.
+    #[inline]
+    fn code_pages_overlap(&self, addr: u64, len: usize) -> bool {
+        if len == 0 || self.code_pages.is_empty() {
+            return false;
+        }
+        let end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        if end <= addr {
+            return !self.code_pages.is_empty();
+        }
+        let mut page = addr >> 12;
+        let last = end.saturating_sub(1) >> 12;
+        while page <= last {
+            if self.code_pages.contains_key(&page) {
+                return true;
+            }
+            page = page.saturating_add(1);
+        }
+        false
+    }
+
+    fn code_pages_add_range(&mut self, guest_start: u64, guest_end: u64) {
+        if guest_end <= guest_start {
+            return;
+        }
+        let mut page = guest_start >> 12;
+        let last = guest_end.saturating_sub(1) >> 12;
+        while page <= last {
+            self.code_pages
+                .entry(page)
+                .and_modify(|c| *c = c.saturating_add(1))
+                .or_insert(1);
+            page = page.saturating_add(1);
+        }
+    }
+
+    fn code_pages_remove_range(&mut self, guest_start: u64, guest_end: u64) {
+        if guest_end <= guest_start {
+            return;
+        }
+        let mut page = guest_start >> 12;
+        let last = guest_end.saturating_sub(1) >> 12;
+        while page <= last {
+            match self.code_pages.get_mut(&page) {
+                Some(c) if *c > 1 => *c = c.saturating_sub(1),
+                Some(_) => {
+                    self.code_pages.remove(&page);
+                }
+                None => {}
+            }
+            page = page.saturating_add(1);
+        }
+    }
+
+    /// Drain pending guest stores into selective code invalidation (safe point).
+    fn drain_pending_code_writes(&mut self) {
+        let (pages, overflow) = self.iced.guest_mem_mut().take_pending_code_writes();
+        if overflow {
+            // Too many / unbounded stores in one slice — drop all Ready code.
+            if !self.cache.is_empty() {
+                self.clear_compiled();
+                self.invalidate_chain_and_shadow();
+                self.stats.code_invs = self.stats.code_invs.saturating_add(1);
+            }
+            return;
+        }
+        // Per-page invalidate (cheap when code_pages is empty / sparse).
+        for page in pages {
+            self.invalidate_code_range(page << 12, PAGE_SIZE_USIZE);
+        }
+    }
+
+    /// Guest span to invalidate when `VirtualFree` succeeds.
+    fn code_inv_span_for_free(
+        &self,
+        addr: u64,
+        size: usize,
+        free_type: u32,
+    ) -> Option<(u64, usize)> {
+        if (free_type & mem::MEM_RELEASE) != 0 {
+            return self.iced.guest_mem().allocation_span_at_base(addr);
+        }
+        if (free_type & mem::MEM_DECOMMIT) != 0 {
+            if size == 0 {
+                return None;
+            }
+            let page_base = addr & !(PAGE_SIZE - 1);
+            let end = addr.saturating_add(u64::try_from(size).unwrap_or(u64::MAX));
+            let page_end = end
+                .saturating_add(PAGE_SIZE - 1)
+                .wrapping_div(PAGE_SIZE)
+                .saturating_mul(PAGE_SIZE);
+            let n = usize::try_from(page_end.saturating_sub(page_base)).unwrap_or(0);
+            if n == 0 {
+                return None;
+            }
+            return Some((page_base, n));
+        }
+        None
+    }
+
+    /// Whether the JIT cache currently has a Ready block at `rip` (tests / diagnostics).
+    #[cfg(test)]
+    #[must_use]
+    fn has_ready_at(&self, rip: u64) -> bool {
+        matches!(self.cache.get(&rip), Some(CacheEntry::Ready(_)))
     }
 
     /// Returns `(result, guest_insns_retired)` for budget accounting.
@@ -408,7 +531,10 @@ impl JitCpu {
         // Iced does not maintain the shadow return stack — drop prediction.
         self.shadow_sp = 0;
         self.stats.iced_insns = self.stats.iced_insns.saturating_add(1);
-        Ok((self.iced.step_once_result()?, 1))
+        let result = self.iced.step_once_result()?;
+        // Phase 4.x: interpreter stores also note pending writes.
+        self.drain_pending_code_writes();
+        Ok((result, 1))
     }
 
     /// True when a Pure block at `rip` ends in a near-call to a registered UCRT fast API.
@@ -608,6 +734,8 @@ impl JitCpu {
         }
         self.stats.load_calls = self.stats.load_calls.saturating_add(ctx.load_calls);
         self.stats.store_calls = self.stats.store_calls.saturating_add(ctx.store_calls);
+        // Phase 4.x: guest stores via `GuestMemory::write` leave a pending range;
+        // apply selective code invalidation only after the native frame returns.
         // Persist multi-way TLB + sticky hot page + shadow stack across chained blocks.
         self.tlb_page = ctx.tlb_page;
         self.tlb_ptr = ctx.tlb_ptr;
@@ -660,7 +788,7 @@ impl JitCpu {
         }
         regs.rflags = ctx.rflags;
         regs.rip = ctx.rip;
-        if ctx.fault != 0 {
+        let fault = if ctx.fault != 0 {
             Some(exec::InvalidMem {
                 access_type: i32::try_from(ctx.fault_access).unwrap_or(0),
                 address: ctx.fault_addr,
@@ -669,7 +797,10 @@ impl JitCpu {
             })
         } else {
             None
-        }
+        };
+        // Safe point: drop Ready blocks overlapping any stores from this block.
+        self.drain_pending_code_writes();
+        fault
     }
 
     fn invalidate_tlb(&mut self) {
@@ -948,10 +1079,10 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        // Only invalidate compiled blocks whose guest code range overlaps the write.
-        // Data writes (stack/heap/TEB) leave the JIT cache and chain table intact.
-        self.invalidate_compiled_overlapping(address, bytes.len());
-        self.iced.mem_write(address, bytes)
+        // Host-side write: apply bytes; `GuestMemory::write` notes pending SMC range.
+        self.iced.mem_write(address, bytes)?;
+        self.drain_pending_code_writes();
+        Ok(())
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
@@ -977,9 +1108,17 @@ impl CpuEngine for JitCpu {
         size: usize,
         free_type: u32,
     ) -> Result<(), CpuError> {
+        // Resolve the guest span before free (RELEASE uses allocation size).
+        let inv_span = self.code_inv_span_for_free(addr, size, free_type);
         // Flush TLB before munmap so JIT never holds freed host pointers.
         self.invalidate_tlb();
-        self.iced.virtual_free(addr, size, free_type)
+        let r = self.iced.virtual_free(addr, size, free_type);
+        if r.is_ok()
+            && let Some((a, n)) = inv_span
+        {
+            self.invalidate_code_range(a, n);
+        }
+        r
     }
 
     fn virtual_protect(
@@ -989,6 +1128,10 @@ impl CpuEngine for JitCpu {
         new_protect: u32,
     ) -> Result<u32, CpuError> {
         let r = self.iced.virtual_protect(addr, size, new_protect);
+        // Phase 4.x: X-loss drops overlapping Ready blocks (not just TLB/pins).
+        if r.is_ok() && !protect::allows_execute(new_protect) {
+            self.invalidate_code_range(addr, size);
+        }
         self.invalidate_tlb();
         r
     }
@@ -1246,5 +1389,188 @@ impl CpuEngine for JitCpu {
     }
     fn read_r12(&mut self) -> Result<u64, CpuError> {
         self.iced.read_r12()
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::mem::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE};
+    use crate::perm;
+
+    unsafe extern "C" fn dummy_block(_ctx: *mut JitCtx) {}
+
+    impl JitCpu {
+        /// Test helper: plant a Ready entry without Cranelift.
+        fn test_plant_ready(&mut self, rip: u64, guest_end: u64) {
+            self.insert_ready(
+                rip,
+                CompiledBlock {
+                    func: dummy_block,
+                    func_id: None,
+                    insn_count: 1,
+                    uses_sse: false,
+                    guest_start: rip,
+                    guest_end,
+                },
+            );
+            if jit_chain_enabled() {
+                let fn_ptr = dummy_block as *const () as usize as u64;
+                chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), rip, fn_ptr);
+            }
+            // Simulate edge IC hit for S6.
+            self.edge_ic_va[0] = rip;
+            self.edge_ic_fn[0] = dummy_block as *const () as usize as u64;
+        }
+    }
+
+    #[test]
+    fn code_inv_x_loss_drops_ready() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1000_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.test_plant_ready(base, base + 16);
+        assert!(cpu.has_ready_at(base));
+        assert!(cpu.code_pages_overlap(base, 16));
+
+        cpu.virtual_protect(base, 0x1000, protect::PAGE_READONLY)
+            .expect("x-loss");
+        assert!(!cpu.has_ready_at(base));
+        assert!(!cpu.code_pages_overlap(base, 16));
+        assert_eq!(cpu.edge_ic_va[0], 0);
+        assert!(cpu.stats().code_invs >= 1);
+    }
+
+    #[test]
+    fn code_inv_smc_write_drops_ready() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1001_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.test_plant_ready(base + 0x10, base + 0x20);
+        assert!(cpu.has_ready_at(base + 0x10));
+
+        // Guest/host store into compiled range.
+        cpu.mem_write(base + 0x12, &[0x90, 0x90]).expect("smc");
+        assert!(!cpu.has_ready_at(base + 0x10));
+        assert_eq!(cpu.edge_ic_fn[0], 0);
+    }
+
+    #[test]
+    fn code_inv_data_write_leaves_code() {
+        let mut cpu = JitCpu::open_x86_64();
+        let code = 0x1002_0000_u64;
+        let data = 0x1003_0000_u64;
+        cpu.virtual_alloc(
+            code,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("code");
+        cpu.virtual_alloc(
+            data,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_READWRITE,
+        )
+        .expect("data");
+        cpu.test_plant_ready(code, code + 8);
+        let invs = cpu.stats().code_invs;
+        cpu.mem_write(data, &[1, 2, 3, 4]).expect("data write");
+        assert!(cpu.has_ready_at(code));
+        assert_eq!(cpu.stats().code_invs, invs);
+        // Edge IC for code entry must survive pure data writes.
+        assert_eq!(cpu.edge_ic_va[0], code);
+    }
+
+    #[test]
+    fn code_inv_free_drops_ready() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1004_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.test_plant_ready(base, base + 4);
+        cpu.virtual_free(base, 0, MEM_RELEASE).expect("free");
+        assert!(!cpu.has_ready_at(base));
+        assert!(cpu.code_pages.is_empty());
+    }
+
+    #[test]
+    fn code_inv_rx_stays_on_x_preserve() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1005_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.test_plant_ready(base, base + 8);
+        // Keep execute; only drop write — code content unchanged.
+        cpu.virtual_protect(base, 0x1000, protect::PAGE_EXECUTE_READ)
+            .expect("rx");
+        assert!(cpu.has_ready_at(base));
+    }
+
+    #[test]
+    fn ranges_overlap_half_open() {
+        assert!(ranges_overlap(0x10, 0x20, 0x1f, 0x30));
+        assert!(!ranges_overlap(0x10, 0x20, 0x20, 0x30));
+        assert!(ranges_overlap(0x10, 0x20, 0x00, 0x11));
+    }
+
+    #[test]
+    fn no_w_tlb_on_executable_page() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1006_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        let e = cpu
+            .iced
+            .guest_mem_mut()
+            .page_tlb_entry(base >> 12)
+            .expect("tlb");
+        assert!(e.allow_r);
+        assert!(!e.allow_w);
+        // Pure RW still allows W soft-translate.
+        let data = 0x1007_0000_u64;
+        cpu.virtual_alloc(
+            data,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_READWRITE,
+        )
+        .expect("data");
+        let e2 = cpu
+            .iced
+            .guest_mem_mut()
+            .page_tlb_entry(data >> 12)
+            .expect("data tlb");
+        assert!(e2.allow_r && e2.allow_w);
+        let _ = perm::ALL; // silence if unused in some cfgs
     }
 }

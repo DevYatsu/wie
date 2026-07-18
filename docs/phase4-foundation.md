@@ -71,7 +71,8 @@ WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh
 - **4.1b** ✅ Stack pin + block-wide super-fast path (one entry guard, bare host mem in body).
 - **4.2** ✅ I-cache policy + edge IC — see [`phase4-jit-coherency.md`](phase4-jit-coherency.md).
 - **4.3** ✅ REP MOVS/STOS host-span bulk — see [`phase4-string-bulk.md`](phase4-string-bulk.md).
-- **Phase 4 core frozen.** **4.x next:** selective code invalidation on protect X-loss / SMC.
+- **Phase 4 core frozen.**
+- **4.x** ✅ Selective code invalidation (X-loss / SMC / free) — see [`phase4-code-invalidation.md`](phase4-code-invalidation.md).
 
 ## Related
 
@@ -80,4 +81,5 @@ WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh
 - Phase 4.1: [`phase4-region-pins.md`](phase4-region-pins.md)
 - Phase 4.2: [`phase4-jit-coherency.md`](phase4-jit-coherency.md)
 - Phase 4.3: [`phase4-string-bulk.md`](phase4-string-bulk.md)
+- Phase 4.x: [`phase4-code-invalidation.md`](phase4-code-invalidation.md)
 - Roadmap: [`Optimization ROADMAP.md`](../Optimization%20ROADMAP.md)
