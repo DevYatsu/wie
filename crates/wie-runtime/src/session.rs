@@ -539,16 +539,34 @@ impl RuntimeSession {
             )
             .context("failed to zero guest FLS table")?;
 
+        // Phase 5 stub data: metrics / syscolors / cwd blob (cwd filled after identity).
+        engine
+            .mem_map(
+                layout.guest_stub_data_base,
+                layout.guest_stub_data_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest stub data page")?;
+        let stub_page = crate::guest_stubs::build_stub_data_page();
+        engine
+            .mem_write(layout.guest_stub_data_base, &stub_page)
+            .context("failed to write guest stub data page")?;
+
+        let stub_cfg = crate::guest_stubs::GuestStubConfig::from_layout(&layout);
+
         // Plant trivial WinAPI as real x86-64 stubs and build stop-bit mask.
-        // Out-of-line helpers (FlsGetValue) land in the guest I/O code page.
+        // OOL helpers live after guest_io ReadFile/SetFP/GetFS (0x000/0x200/0x400).
+        // Use the remainder of the guest_io code mapping (~0x1A00 bytes).
         let mut stop_bitmap = crate::guest_stubs::plant_guest_stubs(
             &mut engine,
             &fake_api_entries,
             layout.fake_api_base,
             layout.fake_api_size,
-            layout.guest_fls_table_base,
-            layout.guest_io_code_base + 0x600, // after ReadFile/SetFP/GetFS impls
-            0x400,                             // FlsGetValue + FlsSetValue out-of-line bodies
+            &stub_cfg,
+            layout.guest_io_code_base + 0x600,
+            layout
+                .guest_io_code_size
+                .saturating_sub(0x600),
         )?;
 
         let guest_io_config = crate::guest_io::install_guest_io(
@@ -728,6 +746,13 @@ impl RuntimeSession {
             module_file_name_a_ptr,
             module_file_name_w_ptr,
             &process,
+        )?;
+
+        // Publish cwd for in-guest GetCurrentDirectoryW (Microsoft Learn path string).
+        crate::guest_stubs::publish_cwd_wide(
+            engine.as_mut(),
+            stub_cfg.cwd_blob_va,
+            &process.current_directory,
         )?;
 
         // UCRT argc/argv/acmdln for CRT-linked and __p__* guest stubs.

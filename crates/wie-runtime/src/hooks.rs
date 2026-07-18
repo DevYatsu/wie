@@ -45,7 +45,13 @@ fn make_entry(
         traits = WinApiTraits::EMPTY.with_exit_process();
     }
     // Align traits with planted guest stubs even if WinApiId map is incomplete.
-    if crate::guest_stubs::classify_guest_stub(&library, &name, 0).is_some() {
+    if crate::guest_stubs::classify_guest_stub(
+        &library,
+        &name,
+        &crate::guest_stubs::GuestStubConfig::CLASSIFY_ONLY,
+    )
+    .is_some()
+    {
         traits.set_guest_stub(true);
         traits.set_noisy(true);
     }

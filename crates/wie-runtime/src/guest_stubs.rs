@@ -1,9 +1,83 @@
 //! In-guest machine-code stubs for trivial WinAPI entries.
 //!
-//! These run entirely inside Unicorn without a host stop when the code hook
+//! These run entirely inside the guest without a host stop when the code hook
 //! treats their instruction bytes as passthrough (see `install_runtime_hooks`).
+//!
+//! # Correctness policy (Microsoft Learn)
+//!
+//! Only plant stubs when the in-guest body can honour the documented API contract
+//! for the subset of behaviour WIE models (fixed guest environment, published
+//! guest memory). **Do not** accelerate APIs with simplified “always success”
+//! answers that diverge from Learn (e.g. `VirtualProtect` with NULL
+//! `lpflOldProtect` must fail; `VirtualQuery` must describe real regions —
+//! those stay on the host until RegionTable-backed handlers exist).
+//!
+//! `LocalAlloc` / `GlobalAlloc` with `LMEM_MOVEABLE` / lock semantics also stay
+//! on the host — a thin `HeapAlloc` wrapper would break real apps.
 
 use anyhow::{Context, Result};
+
+/// Guest-visible layout for Phase 5 data-backed stubs.
+///
+/// Offsets within `data_base` (must match session init):
+/// - `0x000`: metrics `u32[METRICS_COUNT]`
+/// - `0x400`: colors `u32[COLOR_COUNT]`
+/// - `0x500`: cwd blob — `u32 char_count` + UTF-16 path with NUL
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GuestStubConfig {
+    pub fls_table_va: u64,
+    pub metrics_table_va: u64,
+    pub colors_table_va: u64,
+    pub cwd_blob_va: u64,
+    /// `GetCommandLineA` buffer (ANSI, NUL-terminated) in env data page.
+    pub command_line_a_va: u64,
+    /// `GetCommandLineW` buffer (UTF-16, NUL-terminated) in env data page.
+    pub command_line_w_va: u64,
+}
+
+impl GuestStubConfig {
+    /// Placeholder VAs for trait classification only (`is_some()`).
+    pub(crate) const CLASSIFY_ONLY: Self = Self {
+        fls_table_va: 0,
+        metrics_table_va: 0,
+        colors_table_va: 0,
+        cwd_blob_va: 0,
+        command_line_a_va: 0,
+        command_line_w_va: 0,
+    };
+
+    #[must_use]
+    pub(crate) fn from_layout(layout: &crate::memory::RuntimeMemoryLayout) -> Self {
+        let base = layout.guest_stub_data_base;
+        Self {
+            fls_table_va: layout.guest_fls_table_base,
+            metrics_table_va: base,
+            colors_table_va: base + OFFSET_COLORS,
+            cwd_blob_va: base + OFFSET_CWD,
+            command_line_a_va: layout.env_data_base + 0x100,
+            command_line_w_va: layout.env_data_base + 0x200,
+        }
+    }
+}
+
+/// Metrics table length (SM_* indices fit in a byte for common queries).
+pub const METRICS_COUNT: usize = 256;
+/// SysColor table length (COLOR_* indices used by host handler).
+pub const COLOR_COUNT: usize = 32;
+/// Max UTF-16 code units stored for cwd (excluding NUL).
+pub const CWD_MAX_CHARS: usize = 260;
+
+const OFFSET_COLORS: u64 = 0x400;
+const OFFSET_CWD: u64 = 0x500;
+/// Bytes: u32 count + (CWD_MAX_CHARS+1) * u16
+pub const CWD_BLOB_SIZE: usize = 4 + (CWD_MAX_CHARS + 1) * 2;
+
+/// LANGID for en-US (Microsoft Learn primary language + sublanguage).
+const LANG_EN_US: u32 = 0x0409;
+/// Fake desktop HWND (matches `wie_winapi::user32` FAKE_DESKTOP_WINDOW_HANDLE).
+const FAKE_DESKTOP_WINDOW: u64 = 0x0000_0000_6600_0110;
+/// Fake system-color brush base (matches user32).
+const FAKE_SYSCOLOR_BRUSH_BASE: u64 = 0x0000_0000_6601_0000;
 
 /// Kind of in-guest stub to plant at a fake API VA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,28 +89,30 @@ pub(crate) enum GuestStubKind {
     /// `xor eax, eax; ret` — return 0 / FALSE / NULL.
     ReturnZero,
     /// `mov eax, imm32; ret` — fixed 32-bit return in RAX zero-extended.
-    /// Use `ReturnImm32(1)` for TRUE / success.
     ReturnImm32(u32),
     /// `mov rax, imm64; ret` — full 64-bit RAX (fits in 16-byte IAT stride).
     ReturnImm64(u64),
     /// `mov rax, imm64; mov eax, [rax]; ret` — load DWORD from fixed guest VA.
-    /// Used for `GetLastError` reading TEB.LastErrorValue (or a mirror at that VA).
     LoadZx32FromVa(u64),
     /// `mov rax, imm64; mov [rax], ecx; ret` — store DWORD to fixed guest VA.
-    /// Used for `SetLastError` writing TEB.LastErrorValue.
     StoreEcxToVa(u64),
     /// `FlsGetValue`: index in RCX, table of u64 values at fixed VA.
-    /// Out-of-range index returns 0 (matches our host handler).
     FlsGetValue { table_va: u64, max_slots: u32 },
     /// `FlsSetValue`: RCX=index, RDX=value; returns TRUE. OOR → FALSE.
     FlsSetValue { table_va: u64, max_slots: u32 },
     /// `__acrt_iob_func(ix)` → FILE* cookie (stdin/stdout/stderr).
     AcrtIobFunc,
+    /// `GetSystemMetrics` / `GetSysColor`: load `u32` from table\[rcx\] if rcx < max.
+    LoadU32FromTable { table_va: u64, max_index: u32 },
+    /// `GetSysColorBrush`: return `base + color_index` (Microsoft: HBRUSH handle).
+    SysColorBrush { base: u64 },
+    /// `GetCurrentDirectoryW` — Microsoft Learn buffer / return-value rules.
+    GetCurrentDirectoryW { cwd_blob_va: u64 },
 }
 
 impl GuestStubKind {
-    /// Encodes the stub body. Most stubs fit the 16-byte IAT stride; `FlsGetValue`
-    /// is longer and is planted outside the hooked range with a 12-byte `jmp` at the IAT.
+    /// Encodes the stub body. Most stubs fit the 16-byte IAT stride; longer ones
+    /// are planted outside the hooked range with a 12-byte `jmp` at the IAT.
     #[must_use]
     pub(crate) fn encode(self) -> Vec<u8> {
         match self {
@@ -66,68 +142,165 @@ impl GuestStubKind {
             Self::FlsGetValue {
                 table_va,
                 max_slots,
-            } => {
-                // cmp rcx, imm32 ; jae .zero ; mov rax, table ; mov rax, [rax+rcx*8] ; ret
-                // .zero: xor eax,eax ; ret
-                let mut buf = Vec::with_capacity(32);
-                buf.extend_from_slice(&[0x48, 0x81, 0xf9]);
-                buf.extend_from_slice(&max_slots.to_le_bytes());
-                let jae_imm = buf.len() + 1;
-                buf.extend_from_slice(&[0x73, 0x00]); // jae rel8
-                buf.extend_from_slice(&[0x48, 0xb8]);
-                buf.extend_from_slice(&table_va.to_le_bytes());
-                buf.extend_from_slice(&[0x48, 0x8b, 0x04, 0xc8]); // mov rax, [rax+rcx*8]
-                buf.push(0xc3);
-                let zero_at = buf.len();
-                buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
-                let next_ip = jae_imm + 1;
-                let rel = zero_at as isize - next_ip as isize;
-                debug_assert!((-128..128).contains(&rel));
-                buf[jae_imm] = rel as i8 as u8;
-                buf
-            }
+            } => encode_fls_get(table_va, max_slots),
             Self::FlsSetValue {
                 table_va,
                 max_slots,
-            } => {
-                // cmp rcx, max ; jae .fail
-                // mov rax, table ; mov [rax+rcx*8], rdx ; mov eax, 1 ; ret
-                // .fail: xor eax,eax ; ret
-                let mut buf = Vec::with_capacity(40);
-                buf.extend_from_slice(&[0x48, 0x81, 0xf9]);
-                buf.extend_from_slice(&max_slots.to_le_bytes());
-                let jae_imm = buf.len() + 1;
-                buf.extend_from_slice(&[0x73, 0x00]);
-                buf.extend_from_slice(&[0x48, 0xb8]);
-                buf.extend_from_slice(&table_va.to_le_bytes());
-                buf.extend_from_slice(&[0x48, 0x89, 0x14, 0xc8]); // mov [rax+rcx*8], rdx
-                buf.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
-                buf.push(0xc3);
-                let fail_at = buf.len();
-                buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
-                let next_ip = jae_imm + 1;
-                let rel = fail_at as isize - next_ip as isize;
-                debug_assert!((-128..128).contains(&rel));
-                buf[jae_imm] = rel as i8 as u8;
-                buf
-            }
+            } => encode_fls_set(table_va, max_slots),
             Self::AcrtIobFunc => {
-                // Fits 16-byte IAT stride (no bounds check; CRT only passes 0/1/2):
                 // mov eax, 0x68000000 ; shl ecx, 8 ; add eax, ecx ; ret
-                // (32-bit ops zero-extend into RAX)
-                let mut buf = vec![0xb8, 0x00, 0x00, 0x00, 0x68]; // mov eax, 0x68000000
-                buf.extend_from_slice(&[0xc1, 0xe1, 0x08]); // shl ecx, 8
-                buf.extend_from_slice(&[0x01, 0xc8]); // add eax, ecx
-                buf.push(0xc3); // ret
+                let mut buf = vec![0xb8, 0x00, 0x00, 0x00, 0x68];
+                buf.extend_from_slice(&[0xc1, 0xe1, 0x08]);
+                buf.extend_from_slice(&[0x01, 0xc8]);
+                buf.push(0xc3);
                 buf
             }
+            Self::LoadU32FromTable {
+                table_va,
+                max_index,
+            } => encode_load_u32_table(table_va, max_index),
+            Self::SysColorBrush { base } => {
+                // mov rax, base ; add rax, rcx ; ret  (14 bytes — fits IAT stride)
+                let mut buf = vec![0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0];
+                buf[2..10].copy_from_slice(&base.to_le_bytes());
+                buf.extend_from_slice(&[0x48, 0x01, 0xc8, 0xc3]);
+                buf
+            }
+            Self::GetCurrentDirectoryW { cwd_blob_va } => encode_get_current_directory_w(cwd_blob_va),
         }
     }
 
     /// Whether the body must be planted outside the IAT slot (jmp trampoline at entry).
     #[must_use]
     pub(crate) fn needs_out_of_line_helper(self) -> bool {
-        matches!(self, Self::FlsGetValue { .. } | Self::FlsSetValue { .. })
+        matches!(
+            self,
+            Self::FlsGetValue { .. }
+                | Self::FlsSetValue { .. }
+                | Self::LoadU32FromTable { .. }
+                | Self::GetCurrentDirectoryW { .. }
+        )
+    }
+}
+
+fn encode_fls_get(table_va: u64, max_slots: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&[0x48, 0x81, 0xf9]);
+    buf.extend_from_slice(&max_slots.to_le_bytes());
+    let jae_imm = buf.len() + 1;
+    buf.extend_from_slice(&[0x73, 0x00]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&table_va.to_le_bytes());
+    buf.extend_from_slice(&[0x48, 0x8b, 0x04, 0xc8]);
+    buf.push(0xc3);
+    let zero_at = buf.len();
+    buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+    patch_rel8(&mut buf, jae_imm, zero_at);
+    buf
+}
+
+fn encode_fls_set(table_va: u64, max_slots: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(40);
+    buf.extend_from_slice(&[0x48, 0x81, 0xf9]);
+    buf.extend_from_slice(&max_slots.to_le_bytes());
+    let jae_imm = buf.len() + 1;
+    buf.extend_from_slice(&[0x73, 0x00]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&table_va.to_le_bytes());
+    buf.extend_from_slice(&[0x48, 0x89, 0x14, 0xc8]);
+    buf.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]);
+    buf.push(0xc3);
+    let fail_at = buf.len();
+    buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+    patch_rel8(&mut buf, jae_imm, fail_at);
+    buf
+}
+
+fn encode_load_u32_table(table_va: u64, max_index: u32) -> Vec<u8> {
+    // cmp rcx, max ; jae .zero
+    // mov rax, table ; mov eax, [rax+rcx*4] ; ret
+    // .zero: xor eax,eax ; ret
+    let mut buf = Vec::with_capacity(32);
+    buf.extend_from_slice(&[0x48, 0x81, 0xf9]);
+    buf.extend_from_slice(&max_index.to_le_bytes());
+    let jae_imm = buf.len() + 1;
+    buf.extend_from_slice(&[0x73, 0x00]);
+    buf.extend_from_slice(&[0x48, 0xb8]);
+    buf.extend_from_slice(&table_va.to_le_bytes());
+    buf.extend_from_slice(&[0x8b, 0x04, 0x88]); // mov eax, [rax+rcx*4]
+    buf.push(0xc3);
+    let zero_at = buf.len();
+    buf.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+    patch_rel8(&mut buf, jae_imm, zero_at);
+    buf
+}
+
+/// `GetCurrentDirectoryW` per Microsoft Learn:
+/// - success: return chars written **excluding** NUL
+/// - buffer too small / size query: return required size **including** NUL
+/// - size query: `nBufferLength == 0` and `lpBuffer == NULL` (we also treat
+///   null buffer as size query, matching common app patterns and host)
+fn encode_get_current_directory_w(cwd_blob_va: u64) -> Vec<u8> {
+    // Layout: [u32 char_count][u16 path...][u16 0]
+    // RCX = nBufferLength, RDX = lpBuffer
+    //
+    // mov r8, cwd_blob
+    // mov eax, [r8]              ; char_count
+    // lea r9d, [eax+1]           ; required_with_nul
+    // test rdx, rdx
+    // jz .need_size
+    // test rcx, rcx
+    // jz .need_size
+    // cmp rcx, rax               ; need length > char_count (room for NUL)
+    // jbe .need_size
+    // ; copy (char_count+1) UTF-16 units to [rdx]
+    // push rsi / rdi
+    // lea rsi, [r8+4]
+    // mov rdi, rdx
+    // lea ecx, [eax+1]
+    // rep movsw
+    // pop rdi / rsi
+    // ; eax still char_count (rep uses ecx only)
+    // ret
+    // .need_size: mov eax, r9d ; ret
+    let mut buf = Vec::with_capacity(80);
+    buf.extend_from_slice(&[0x49, 0xb8]); // mov r8, imm64
+    buf.extend_from_slice(&cwd_blob_va.to_le_bytes());
+    buf.extend_from_slice(&[0x41, 0x8b, 0x00]); // mov eax, [r8]
+    buf.extend_from_slice(&[0x44, 0x8d, 0x48, 0x01]); // lea r9d, [rax+1]
+    buf.extend_from_slice(&[0x48, 0x85, 0xd2]); // test rdx, rdx
+    let jz1 = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]); // jz .need_size
+    buf.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
+    let jz2 = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]);
+    buf.extend_from_slice(&[0x48, 0x39, 0xc1]); // cmp rcx, rax
+    let jbe = buf.len() + 1;
+    buf.extend_from_slice(&[0x76, 0x00]); // jbe .need_size
+    // preserve RSI/RDI (Win64 non-volatiles)
+    buf.extend_from_slice(&[0x56, 0x57]); // push rsi, rdi
+    buf.extend_from_slice(&[0x49, 0x8d, 0x70, 0x04]); // lea rsi, [r8+4]
+    buf.extend_from_slice(&[0x48, 0x89, 0xd7]); // mov rdi, rdx
+    buf.extend_from_slice(&[0x8d, 0x48, 0x01]); // lea ecx, [rax+1]
+    buf.extend_from_slice(&[0xf3, 0xa5]); // rep movsw
+    buf.extend_from_slice(&[0x5f, 0x5e]); // pop rdi, rsi
+    // restore eax = char_count (destroyed by lea ecx if we only used eax — eax intact)
+    buf.push(0xc3);
+    let need_size = buf.len();
+    buf.extend_from_slice(&[0x44, 0x89, 0xc8]); // mov eax, r9d
+    buf.push(0xc3);
+    patch_rel8(&mut buf, jz1, need_size);
+    patch_rel8(&mut buf, jz2, need_size);
+    patch_rel8(&mut buf, jbe, need_size);
+    buf
+}
+
+fn patch_rel8(buf: &mut [u8], imm_at: usize, target: usize) {
+    let next_ip = imm_at + 1;
+    let rel = target as isize - next_ip as isize;
+    debug_assert!((-128..128).contains(&rel), "rel8 out of range: {rel}");
+    if let Some(slot) = buf.get_mut(imm_at) {
+        *slot = rel as i8 as u8;
     }
 }
 
@@ -137,15 +310,12 @@ pub const TEB_LAST_ERROR_VA: u64 = 0x68;
 /// Guest FLS table slot count (index 0..N-1 accelerated).
 pub const GUEST_FLS_SLOT_COUNT: u32 = 256;
 
-/// Classify a library/export as an in-guest stub when safe.
-///
-/// Only pure functions with no guest-memory side effects and fixed results
-/// (or results fully published into guest memory by the host).
+/// Classify a library/export as an in-guest stub when safe under Microsoft Learn.
 #[must_use]
 pub(crate) fn classify_guest_stub(
     library: &str,
     name: &str,
-    fls_table_va: u64,
+    cfg: &GuestStubConfig,
 ) -> Option<GuestStubKind> {
     // UCRT pure helpers: cover indirect `call reg` paths that miss the JIT near-call
     // fast path (still no host-stop). Matches FILE* cookies / CRT slots in `wie_winapi::ucrt`.
@@ -173,7 +343,6 @@ pub(crate) fn classify_guest_stub(
         {
             return Some(GuestStubKind::ReturnZero);
         }
-        // __p__* → pointer to pre-mapped CRT guest slots (session maps 0x68000000 page).
         if n.eq_ignore_ascii_case("__p__environ") {
             return Some(GuestStubKind::ReturnImm64(CRT + 0x300));
         }
@@ -192,16 +361,43 @@ pub(crate) fn classify_guest_stub(
         if n.eq_ignore_ascii_case("__p__acmdln") {
             return Some(GuestStubKind::ReturnImm64(CRT + 0x328));
         }
-        // malloc/free/memcpy/strlen/fwrite stay on JIT import / host path.
-        return None;
-    }
-
-    if !library.eq_ignore_ascii_case("KERNEL32.dll") && !library.eq_ignore_ascii_case("ntdll.dll") {
-        // Keep USER32/GDI out of guest stubs for now (window state matters).
         return None;
     }
 
     let n = name;
+
+    // --- USER32 pure queries (fixed guest desktop environment) ---
+    if library.eq_ignore_ascii_case("USER32.dll") {
+        if n.eq_ignore_ascii_case("GetSystemMetrics") {
+            return Some(GuestStubKind::LoadU32FromTable {
+                table_va: cfg.metrics_table_va,
+                max_index: METRICS_COUNT as u32,
+            });
+        }
+        if n.eq_ignore_ascii_case("GetSysColor") {
+            return Some(GuestStubKind::LoadU32FromTable {
+                table_va: cfg.colors_table_va,
+                max_index: COLOR_COUNT as u32,
+            });
+        }
+        if n.eq_ignore_ascii_case("GetSysColorBrush") {
+            // Microsoft: returns a handle to the logical brush; we use a stable
+            // fake HBRUSH space base+index (same as host user32 handler).
+            return Some(GuestStubKind::SysColorBrush {
+                base: FAKE_SYSCOLOR_BRUSH_BASE,
+            });
+        }
+        if n.eq_ignore_ascii_case("GetDesktopWindow") {
+            // Microsoft: handle to the desktop window — single fake desktop HWND.
+            return Some(GuestStubKind::ReturnImm64(FAKE_DESKTOP_WINDOW));
+        }
+        return None;
+    }
+
+    if !library.eq_ignore_ascii_case("KERNEL32.dll") && !library.eq_ignore_ascii_case("ntdll.dll") {
+        return None;
+    }
+
     if n.eq_ignore_ascii_case("EncodePointer") || n.eq_ignore_ascii_case("DecodePointer") {
         return Some(GuestStubKind::IdentityRcxToRax);
     }
@@ -212,8 +408,6 @@ pub(crate) fn classify_guest_stub(
         return Some(GuestStubKind::VoidRet);
     }
     // InitializeCriticalSection* stays on host (writes RTL_CRITICAL_SECTION).
-    // GetLastError / SetLastError: TEB.LastErrorValue at guest VA 0x68. Host handlers
-    // publish `state.last_error` there after every stop so coherence is preserved.
     if n.eq_ignore_ascii_case("GetLastError") {
         return Some(GuestStubKind::LoadZx32FromVa(TEB_LAST_ERROR_VA));
     }
@@ -222,13 +416,13 @@ pub(crate) fn classify_guest_stub(
     }
     if n.eq_ignore_ascii_case("FlsGetValue") {
         return Some(GuestStubKind::FlsGetValue {
-            table_va: fls_table_va,
+            table_va: cfg.fls_table_va,
             max_slots: GUEST_FLS_SLOT_COUNT,
         });
     }
     if n.eq_ignore_ascii_case("FlsSetValue") {
         return Some(GuestStubKind::FlsSetValue {
-            table_va: fls_table_va,
+            table_va: cfg.fls_table_va,
             max_slots: GUEST_FLS_SLOT_COUNT,
         });
     }
@@ -252,7 +446,7 @@ pub(crate) fn classify_guest_stub(
         return Some(GuestStubKind::ReturnZero);
     }
     if n.eq_ignore_ascii_case("Sleep") {
-        // Treat all Sleep as no-op (including non-zero); fine for editor path.
+        // No-op Sleep is a pre-existing policy (Phase 6 will park). Not expanded here.
         return Some(GuestStubKind::VoidRet);
     }
     if n.eq_ignore_ascii_case("GetACP") {
@@ -261,31 +455,132 @@ pub(crate) fn classify_guest_stub(
     if n.eq_ignore_ascii_case("GetOEMCP") {
         return Some(GuestStubKind::ReturnImm32(437));
     }
+    // Microsoft Learn: LANGID en-US = 0x0409 for both when guest is fixed en-US.
+    if n.eq_ignore_ascii_case("GetSystemDefaultLangID")
+        || n.eq_ignore_ascii_case("GetUserDefaultLangID")
+    {
+        return Some(GuestStubKind::ReturnImm32(LANG_EN_US));
+    }
     if n.eq_ignore_ascii_case("GetCurrentProcess") {
-        // Windows process pseudohandle (HANDLE)(LONG_PTR)-1.
+        // Microsoft: (HANDLE)(LONG_PTR)-1 process pseudohandle.
         return Some(GuestStubKind::ReturnImm64(u64::MAX));
     }
     if n.eq_ignore_ascii_case("GetProcessHeap") {
-        // Matches RuntimeMemoryLayout::process_heap_handle default 0x5000_0000.
         return Some(GuestStubKind::ReturnImm64(0x0000_0000_5000_0000));
     }
+    // Microsoft: returns pointer to the command-line string for the process.
+    if n.eq_ignore_ascii_case("GetCommandLineA") {
+        return Some(GuestStubKind::ReturnImm64(cfg.command_line_a_va));
+    }
+    if n.eq_ignore_ascii_case("GetCommandLineW") {
+        return Some(GuestStubKind::ReturnImm64(cfg.command_line_w_va));
+    }
+    if n.eq_ignore_ascii_case("GetCurrentDirectoryW") {
+        return Some(GuestStubKind::GetCurrentDirectoryW {
+            cwd_blob_va: cfg.cwd_blob_va,
+        });
+    }
+
+    // Intentionally NOT stubbed (would damage apps if simplified):
+    // - VirtualProtect: NULL lpflOldProtect must fail (Learn); real protect later Phase 3
+    // - VirtualQuery: must describe real VA regions (RegionTable)
+    // - LocalAlloc/GlobalAlloc: LMEM_MOVEABLE / lock / size-0 discard semantics
+    // - SetUnhandledExceptionFilter: must return previous filter for chaining
 
     None
+}
+
+/// Builds metrics/colors tables matching host `fake_system_metric` / `GetSysColor`.
+pub(crate) fn build_stub_data_page() -> Vec<u8> {
+    let mut page = vec![0_u8; 0x500 + CWD_BLOB_SIZE];
+    // Metrics
+    for i in 0..METRICS_COUNT {
+        let v = fake_system_metric(i as u64) as u32;
+        let off = i * 4;
+        page[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // Colors at OFFSET_COLORS
+    let color_base = OFFSET_COLORS as usize;
+    for i in 0..COLOR_COUNT {
+        let v = fake_sys_color(i as u64) as u32;
+        let off = color_base + i * 4;
+        page[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // cwd blob starts empty (char_count = 0); session fills after process identity.
+    page
+}
+
+/// Publish UTF-16 current directory into the guest cwd blob (Microsoft path string).
+pub(crate) fn publish_cwd_wide(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    cwd_blob_va: u64,
+    directory: &str,
+) -> Result<()> {
+    let mut units: Vec<u16> = directory.encode_utf16().collect();
+    if units.len() > CWD_MAX_CHARS {
+        units.truncate(CWD_MAX_CHARS);
+    }
+    let char_count = u32::try_from(units.len()).context("cwd char_count overflow")?;
+    units.push(0); // NUL
+    let mut blob = vec![0_u8; CWD_BLOB_SIZE];
+    blob[0..4].copy_from_slice(&char_count.to_le_bytes());
+    for (i, u) in units.iter().enumerate() {
+        let off = 4 + i * 2;
+        if off + 2 <= blob.len() {
+            blob[off..off + 2].copy_from_slice(&u.to_le_bytes());
+        }
+    }
+    engine
+        .mem_write(cwd_blob_va, &blob)
+        .context("failed to publish guest cwd blob")?;
+    Ok(())
+}
+
+/// Must match `wie_winapi::user32::fake_system_metric`.
+fn fake_system_metric(metric_index: u64) -> u64 {
+    match metric_index {
+        0 | 16 => 1024,
+        1 => 768,
+        2 | 3 => 17,
+        4 => 23,
+        5 | 6 | 19 | 80 => 1,
+        7 | 8 | 32 | 33 | 36 | 37 => 4,
+        11..=14 => 32,
+        15 => 20,
+        17 => 728,
+        28 | 34 => 112,
+        29 | 35 => 27,
+        30 | 31 => 18,
+        38 | 39 => 75,
+        _ => 0,
+    }
+}
+
+/// Must match `wie_winapi::user32::handle_get_sys_color` COLORREF values.
+fn fake_sys_color(color_index: u64) -> u64 {
+    match color_index {
+        1 | 6 | 7..=9 | 18 => 0x0000_0000,
+        2 | 13 => 0x00d7_7830,
+        3 => 0x00bf_bfbf,
+        5 | 14 => 0x00ff_ffff,
+        10 | 11 => 0x00b4_b4b4,
+        12 => 0x00ab_abab,
+        16 => 0x00a0_a0a0,
+        17 => 0x006d_6d6d,
+        0 => 0x00c8_c8c8,
+        _ => 0x00f0_f0f0,
+    }
 }
 
 /// Writes guest stubs into the fake-API mapping and builds a stop-bit mask.
 ///
 /// Bitmap: bit=1 means "host must stop here", bit=0 means passthrough (guest stub).
-/// Initialized to all-ones (stop everywhere), then cleared over each stub body.
-///
-/// `helper_code_base` / `helper_code_size` is a region **outside** the fake-API
-/// hook range for out-of-line helpers (e.g. FlsGetValue body).
 pub(crate) fn plant_guest_stubs(
     engine: &mut dyn wie_cpu::CpuEngine,
     entries: &[crate::hooks::RuntimeFakeApiEntry],
     fake_api_base: u64,
     fake_api_size: usize,
-    fls_table_va: u64,
+    cfg: &GuestStubConfig,
     helper_code_base: u64,
     helper_code_size: usize,
 ) -> Result<Vec<u8>> {
@@ -296,7 +591,7 @@ pub(crate) fn plant_guest_stubs(
     let helper_end = helper_code_base.saturating_add(helper_code_size as u64);
 
     for entry in entries {
-        let Some(kind) = classify_guest_stub(&entry.library, &entry.name, fls_table_va) else {
+        let Some(kind) = classify_guest_stub(&entry.library, &entry.name, cfg) else {
             continue;
         };
         let body = kind.encode();
@@ -308,7 +603,6 @@ pub(crate) fn plant_guest_stubs(
             .context("guest stub VA offset does not fit usize")?;
 
         if kind.needs_out_of_line_helper() {
-            // Plant body outside hook range; IAT slot gets mov rax,imm64; jmp rax.
             let body_len = body.len() as u64;
             if helper_cursor
                 .checked_add(body_len)
@@ -366,5 +660,41 @@ fn clear_bit(bitmap: &mut [u8], bit_index: usize) {
     let bit = bit_index % 8;
     if let Some(slot) = bitmap.get_mut(byte) {
         *slot &= !(1_u8 << bit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_cwd_stub_encodes_and_patches_rel8() {
+        let body = GuestStubKind::GetCurrentDirectoryW {
+            cwd_blob_va: 0x7000_0004_3500,
+        }
+        .encode();
+        assert!(body.len() > 20);
+        assert_eq!(*body.last().unwrap(), 0xc3);
+    }
+
+    #[test]
+    fn metrics_table_matches_known_sm() {
+        let page = build_stub_data_page();
+        // SM_CXSCREEN = 0 → 1024
+        assert_eq!(&page[0..4], &1024_u32.to_le_bytes());
+        // SM_CYSCREEN = 1 → 768
+        assert_eq!(&page[4..8], &768_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn classify_langid_and_not_virtual_protect() {
+        let cfg = GuestStubConfig::CLASSIFY_ONLY;
+        assert!(matches!(
+            classify_guest_stub("KERNEL32.dll", "GetSystemDefaultLangID", &cfg),
+            Some(GuestStubKind::ReturnImm32(0x0409))
+        ));
+        assert!(classify_guest_stub("KERNEL32.dll", "VirtualProtect", &cfg).is_none());
+        assert!(classify_guest_stub("KERNEL32.dll", "VirtualQuery", &cfg).is_none());
+        assert!(classify_guest_stub("KERNEL32.dll", "LocalAlloc", &cfg).is_none());
     }
 }

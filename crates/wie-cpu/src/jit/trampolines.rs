@@ -177,13 +177,16 @@ fn classify_three_insn(a: &iced_x86::Instruction, b: &iced_x86::Instruction) -> 
 
 // --- Imm32 trampoline table (small fixed set of common constants) ---
 
-/// Common imm32 returns used by guest stubs (TRUE, process/thread ids, tick).
+/// Common imm32 returns used by guest stubs (TRUE, process/thread ids, tick, locale).
 fn tramp_return_imm32_dispatch(imm: u32) -> unsafe extern "C" fn(*mut JitCtx) {
     match imm {
         0 => tramp_return_zero,
         1 => tramp_return_imm_1,
+        0x0409 => tramp_return_imm_0409, // LANG_EN_US
         0x1234 => tramp_return_imm_1234,
         0x5678 => tramp_return_imm_5678,
+        437 => tramp_return_imm_437,   // GetOEMCP
+        1252 => tramp_return_imm_1252, // GetACP
         12_345 => tramp_return_imm_12345,
         // Uncommon imm: still avoid Cranelift via a slow generic path.
         _ => tramp_return_imm32_generic,
@@ -244,6 +247,30 @@ unsafe extern "C" fn tramp_return_imm_12345(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
     mark_dirty(ctx, MicroStub::ReturnImm32(12_345).dirty_mask());
     ctx.gpr[0] = 12_345;
+    guest_ret(ctx);
+    chain_tail(ctx);
+}
+
+unsafe extern "C" fn tramp_return_imm_0409(ctx: *mut JitCtx) {
+    let ctx = unsafe { &mut *ctx };
+    mark_dirty(ctx, MicroStub::ReturnImm32(0x0409).dirty_mask());
+    ctx.gpr[0] = 0x0409;
+    guest_ret(ctx);
+    chain_tail(ctx);
+}
+
+unsafe extern "C" fn tramp_return_imm_437(ctx: *mut JitCtx) {
+    let ctx = unsafe { &mut *ctx };
+    mark_dirty(ctx, MicroStub::ReturnImm32(437).dirty_mask());
+    ctx.gpr[0] = 437;
+    guest_ret(ctx);
+    chain_tail(ctx);
+}
+
+unsafe extern "C" fn tramp_return_imm_1252(ctx: *mut JitCtx) {
+    let ctx = unsafe { &mut *ctx };
+    mark_dirty(ctx, MicroStub::ReturnImm32(1252).dirty_mask());
+    ctx.gpr[0] = 1252;
     guest_ret(ctx);
     chain_tail(ctx);
 }

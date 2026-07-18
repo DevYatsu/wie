@@ -1744,6 +1744,7 @@ impl WinApiId {
                     .with_guest_stub()
             }
             // In-guest stubs / guest-accelerated (may still hit host fallback VAs).
+            // Only APIs whose guest body matches Microsoft Learn + fixed WIE environment.
             Self::Kernel32Encodepointer
             | Self::Kernel32Decodepointer
             | Self::Kernel32Gettickcount
@@ -1752,6 +1753,11 @@ impl WinApiId {
             | Self::Kernel32Sleep
             | Self::Kernel32Getacp
             | Self::Kernel32Getoemcp
+            | Self::Kernel32Getsystemdefaultlangid
+            | Self::Kernel32Getuserdefaultlangid
+            | Self::Kernel32Getcommandlinea
+            | Self::Kernel32Getcommandlinew
+            | Self::Kernel32Getcurrentdirectoryw
             | Self::Kernel32Getlasterror
             | Self::Kernel32Setlasterror
             | Self::Kernel32Flsgetvalue
@@ -1761,7 +1767,11 @@ impl WinApiId {
             | Self::Kernel32Readfile
             | Self::Kernel32Setfilepointer
             | Self::Kernel32Getfilesize
-            | Self::Kernel32Multibytetowidechar => {
+            | Self::Kernel32Multibytetowidechar
+            | Self::User32Getsystemmetrics
+            | Self::User32Getsyscolor
+            | Self::User32Getsyscolorbrush
+            | Self::User32Getdesktopwindow => {
                 WinApiTraits::EMPTY.with_noisy().with_guest_stub()
             }
             Self::Kernel32Getfileinformationbyhandle

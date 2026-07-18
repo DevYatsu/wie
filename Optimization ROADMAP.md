@@ -134,29 +134,37 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ---
 
-## Phase 5 – Guest Stub Expansion
+## Phase 5 – Guest Stub Expansion ✅
 
 **Goal:** Reduce host‑stop frequency by implementing more common WinAPI calls as in‑guest machine‑code stubs.
 
-**Candidates (not exhaustive):**
+**Correctness policy (Microsoft Learn):** Only plant guest stubs when the body can honour the documented API contract for the subset WIE models. **Do not** accelerate with “always success” simplifications that damage real apps (e.g. `VirtualProtect` with NULL `lpflOldProtect` must fail; `VirtualQuery` needs real regions; `LocalAlloc`/`GlobalAlloc` keep MOVEABLE/lock semantics on host).
+
+**In-guest (Phase 5 + prior):**
 
 - `GetACP`, `GetOEMCP`, `GetSystemDefaultLangID`, `GetUserDefaultLangID`
-- `GetCurrentProcessId`, `GetCurrentThreadId`
-- `GetTickCount`, `GetProcessHeap`
-- `GetSystemMetrics`, `GetSysColor`
-- `VirtualProtect`, `VirtualQuery` (always success)
-- `GetCurrentDirectoryW` (read from guest memory)
-- `GetFileSize`, `SetFilePointer` (if using guest table)
-- `GlobalAlloc`/`LocalAlloc` (thin wrappers around heap)
-- Many `USER32` query functions
+- `GetCurrentProcessId`, `GetCurrentThreadId`, `GetCurrentProcess`, `GetProcessHeap`
+- `GetTickCount`, `GetLastError` / `SetLastError`, FLS, CS enter/leave/delete
+- `GetCommandLineA` / `GetCommandLineW` (published env buffers)
+- `GetCurrentDirectoryW` (guest cwd blob; Learn return-value rules)
+- `GetSystemMetrics`, `GetSysColor`, `GetSysColorBrush`, `GetDesktopWindow` (fixed guest desktop tables/handles)
+- `GetFileSize` / `SetFilePointer` via guest I/O table (pre-existing accelerator)
+
+**Stays on host (intentionally):**
+
+- `VirtualProtect` / `VirtualQuery` — host fixed to fail on NULL `lpflOldProtect` (Learn); full protect/query via RegionTable is Phase 3
+- `LocalAlloc` / `GlobalAlloc` / Free — MOVEABLE / lock / size-0 discard must not be faked as plain `HeapAlloc`
+- Module APIs (`GetModuleHandle*`, `GetProcAddress`, `LoadLibrary*`)
 
 **Implementation:**
 
-- Extend `GuestStubKind` with new variants.
-- Generate stub code in `plant_guest_stubs`.
-- For stubs that need guest‑visible state (e.g., file table), keep a shared memory structure.
+- `GuestStubConfig` + guest data page (metrics, colors, cwd) in `RuntimeMemoryLayout`
+- Extended `GuestStubKind` / `plant_guest_stubs` / expanded OOL helper budget
+- Host `VirtualProtect` corrected for NULL `lpflOldProtect`
 
-**DoD:** Micro‑suite still passes; host‑stop count on typical API‑heavy workloads drops by 50–70%.
+**DoD:** Micro‑suite still passes; clippy clean; host‑stop drop on workloads that call the accelerated set (track C). Pure loops unchanged.
+
+**Status (2026-07-18):** Done under Microsoft Learn policy above.
 
 ---
 

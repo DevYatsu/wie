@@ -74,6 +74,9 @@ pub struct RuntimeMemoryLayout {
     /// Guest MultiByteToWideChar helper code.
     pub guest_mbwc_code_base: u64,
     pub guest_mbwc_code_size: usize,
+    /// Guest-visible tables for Phase 5 stubs (metrics, colors, cwd wide path).
+    pub guest_stub_data_base: u64,
+    pub guest_stub_data_size: usize,
 }
 
 impl RuntimeMemoryLayout {
@@ -122,6 +125,9 @@ impl RuntimeMemoryLayout {
             guest_heap_code_size: 0x1000,
             guest_mbwc_code_base: 0x0000_7000_0004_2000,
             guest_mbwc_code_size: 0x1000,
+            // Metrics[256×u32] + colors[32×u32] + cwd wide blob.
+            guest_stub_data_base: 0x0000_7000_0004_3000,
+            guest_stub_data_size: 0x2000,
         }
     }
 

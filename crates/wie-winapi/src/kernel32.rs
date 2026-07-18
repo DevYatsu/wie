@@ -4266,6 +4266,12 @@ fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, handle: u64) 
 }
 
 /// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
+///
+/// Microsoft Learn return value:
+/// - success: number of characters written **excluding** the terminating NUL
+/// - buffer too small: required size **including** the terminating NUL
+/// - size query: `lpBuffer == NULL` and `nBufferLength == 0` → required size with NUL
+/// - failure: zero (not used for the insufficient-buffer case)
 pub fn handle_get_current_directory_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &WinApiState,
@@ -4287,7 +4293,10 @@ pub fn handle_get_current_directory_w(
         .checked_add(1)
         .context("GetCurrentDirectoryW required size overflow")?;
 
-    let return_value = if buffer_length == 0 || buffer_ptr == 0 || buffer_length <= character_count
+    // Need nBufferLength > character_count so there is room for the NUL.
+    let return_value = if buffer_ptr == 0
+        || buffer_length == 0
+        || buffer_length <= character_count
     {
         required_with_nul
     } else {
@@ -4399,7 +4408,9 @@ pub fn dispatch_kernel32_extra(
     }
 }
 
-/// `VirtualProtect` — accept and report success (no real page protection model yet).
+/// `VirtualProtect` — Microsoft Learn: `lpflOldProtect` must be non-NULL or the
+/// call fails. Real page protection is still deferred (Phase 3 RegionTable);
+/// when `lpflOldProtect` is valid we report previous protect as PAGE_EXECUTE_READWRITE.
 fn handle_virtual_protect(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -4408,10 +4419,17 @@ fn handle_virtual_protect(
     let _size = engine.read_rdx()?;
     let _new = engine.read_r8()?;
     let old_prot = engine.read_r9()?;
-    if old_prot != 0 {
-        // PAGE_EXECUTE_READWRITE
-        write_guest_u32(engine, old_prot, 0x40)?;
+    // Microsoft Learn: if lpflOldProtect is NULL or invalid, the function fails.
+    if old_prot == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
     }
+    // PAGE_EXECUTE_READWRITE — provisional previous protect until RegionTable.
+    write_guest_u32(engine, old_prot, 0x40)?;
     state.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
