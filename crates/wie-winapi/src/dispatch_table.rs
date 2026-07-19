@@ -1493,6 +1493,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "_onexit"
                 | "__dllonexit"
                 | "_beginthreadex"
+                | "_endthreadex"
                 | "_purecall"
         );
     }

@@ -31,8 +31,9 @@ pub mod winmm;
 pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};
 pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
 pub use sync_obj::{
-    CsWaitQueue, INFINITE, KernelObject, PendingSpawn, STILL_ACTIVE, SyncState, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
+    CsWaitQueue, INFINITE, KernelObject, MAXIMUM_WAIT_OBJECTS, PendingSpawn, STILL_ACTIVE,
+    SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
+    wait_multiple,
 };
 // HostParkReason is defined with WinApiControlSignal below.
 pub use fake_va::{
@@ -733,6 +734,11 @@ pub enum HostParkReason {
         /// Timeout in ms (`INFINITE` = forever).
         timeout_ms: u32,
     },
+    /// `WaitForMultipleObjects` — handles live in [`SyncState::multi_wait`].
+    ///
+    /// Kept small/`Copy` so [`WinApiControlSignal`] stays compact; the handle
+    /// list is stored on process sync state for the duration of the park.
+    WaitMultiple,
 }
 
 mod dispatch_table;

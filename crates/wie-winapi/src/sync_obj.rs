@@ -37,8 +37,23 @@ pub struct SyncState {
     pub next_stack_slot: u32,
     /// Threads waiting to be spawned by the session after `CreateThread`.
     pub pending_spawns: Vec<PendingSpawn>,
+    /// `CREATE_SUSPENDED` threads awaiting `ResumeThread` (keyed by handle).
+    pub suspended_spawns: HashMap<u64, PendingSpawn>,
+    /// Pending `WaitForMultipleObjects` args, keyed by guest TID of the waiter.
+    pub multi_wait: HashMap<u32, MultiWaitRequest>,
     /// Process is dying (`ExitProcess`); workers should stop.
     pub process_dying: bool,
+}
+
+/// Detached args for one `WaitForMultipleObjects` host park.
+#[derive(Debug, Clone)]
+pub struct MultiWaitRequest {
+    /// Kernel handles to wait on.
+    pub handles: Vec<u64>,
+    /// Wait for all (`true`) or any (`false`).
+    pub wait_all: bool,
+    /// Timeout in ms (`INFINITE` = forever).
+    pub timeout_ms: u32,
 }
 
 impl SyncState {
@@ -52,6 +67,8 @@ impl SyncState {
             cs_waiters: HashMap::new(),
             next_stack_slot: 1,
             pending_spawns: Vec::new(),
+            suspended_spawns: HashMap::new(),
+            multi_wait: HashMap::new(),
             process_dying: false,
         }
     }
@@ -97,11 +114,31 @@ impl SyncState {
         (handle, obj)
     }
 
+    /// Register a Win32 semaphore (`CreateSemaphore*`).
+    pub fn register_semaphore(
+        &mut self,
+        initial_count: i32,
+        maximum_count: i32,
+    ) -> (u64, Arc<SemaphoreObject>) {
+        let handle = self.alloc_handle();
+        let initial = initial_count.clamp(0, maximum_count.max(0));
+        let maximum = maximum_count.max(1);
+        let obj = Arc::new(SemaphoreObject {
+            handle,
+            maximum,
+            state: Mutex::new(SemaphoreInner { count: initial }),
+            cv: Condvar::new(),
+        });
+        self.objects
+            .insert(handle, KernelObject::Semaphore(Arc::clone(&obj)));
+        (handle, obj)
+    }
+
     /// Look up a thread object by handle.
     pub fn thread_by_handle(&self, handle: u64) -> Option<Arc<ThreadObject>> {
         match self.objects.get(&handle)? {
             KernelObject::Thread(t) => Some(Arc::clone(t)),
-            KernelObject::Event(_) => None,
+            KernelObject::Event(_) | KernelObject::Semaphore(_) => None,
         }
     }
 
@@ -148,6 +185,8 @@ pub enum KernelObject {
     Thread(Arc<ThreadObject>),
     /// Auto/manual-reset event.
     Event(Arc<EventObject>),
+    /// Counting semaphore.
+    Semaphore(Arc<SemaphoreObject>),
 }
 
 /// Guest thread waitable + exit state.
@@ -310,6 +349,113 @@ impl EventObject {
     }
 }
 
+/// Win32 counting semaphore.
+#[derive(Debug)]
+pub struct SemaphoreObject {
+    /// Kernel handle.
+    pub handle: u64,
+    /// Maximum count (`lMaximumCount`).
+    pub maximum: i32,
+    /// Current count under mutex.
+    pub state: Mutex<SemaphoreInner>,
+    /// Waiters for count &gt; 0.
+    pub cv: Condvar,
+}
+
+/// Interior of a semaphore (under mutex).
+#[derive(Debug)]
+pub struct SemaphoreInner {
+    /// Current count (`0..=maximum`).
+    pub count: i32,
+}
+
+impl SemaphoreObject {
+    /// Non-blocking acquire: true if a unit was taken.
+    pub fn try_acquire(&self) -> bool {
+        let Ok(mut g) = self.state.lock() else {
+            return false;
+        };
+        if g.count > 0 {
+            g.count = g.count.saturating_sub(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Wait until a unit is available (decrements). Returns false on timeout.
+    pub fn wait(&self, timeout_ms: u32) -> bool {
+        let Ok(mut guard) = self.state.lock() else {
+            return true;
+        };
+        if guard.count > 0 {
+            guard.count = guard.count.saturating_sub(1);
+            return true;
+        }
+        if timeout_ms == 0 {
+            return false;
+        }
+        if timeout_ms == INFINITE {
+            while guard.count <= 0 {
+                guard = match self.cv.wait(guard) {
+                    Ok(x) => x,
+                    Err(p) => p.into_inner(),
+                };
+            }
+            guard.count = guard.count.saturating_sub(1);
+            return true;
+        }
+        let remain = Duration::from_millis(u64::from(timeout_ms));
+        let (next, timeout_result) = match self.cv.wait_timeout(guard, remain) {
+            Ok(x) => x,
+            Err(p) => {
+                let (inner, _) = p.into_inner();
+                return inner.count > 0;
+            }
+        };
+        guard = next;
+        if guard.count > 0 {
+            guard.count = guard.count.saturating_sub(1);
+            return true;
+        }
+        if timeout_result.timed_out() {
+            return false;
+        }
+        // Spurious wake: treat as timeout for short waits (caller may retry).
+        false
+    }
+
+    /// `ReleaseSemaphore` — add `release_count` units. Returns previous count, or `None` if invalid.
+    pub fn release(&self, release_count: i32) -> Option<i32> {
+        if release_count <= 0 {
+            return None;
+        }
+        let Ok(mut g) = self.state.lock() else {
+            return None;
+        };
+        let prev = g.count;
+        let new = prev.checked_add(release_count)?;
+        if new > self.maximum {
+            return None;
+        }
+        g.count = new;
+        // Wake waiters proportional to units released (notify_all is safe).
+        if prev == 0 {
+            self.cv.notify_all();
+        } else {
+            for _ in 0..release_count.min(16) {
+                self.cv.notify_one();
+            }
+        }
+        Some(prev)
+    }
+
+    /// Wake all waiters during process teardown (does not change count semantics for dying).
+    pub fn notify_all(&self) {
+        self.cv.notify_all();
+    }
+}
+
 /// Wait queue for one guest critical section VA.
 #[derive(Debug)]
 pub struct CsWaitQueue {
@@ -364,9 +510,20 @@ pub enum WaitTarget {
     Thread(Arc<ThreadObject>),
     /// Event object.
     Event(Arc<EventObject>),
+    /// Semaphore object.
+    Semaphore(Arc<SemaphoreObject>),
 }
 
 impl WaitTarget {
+    /// Non-blocking check / consume. True if the wait would succeed immediately.
+    pub fn try_wait(&self) -> bool {
+        match self {
+            Self::Thread(t) => t.is_finished(),
+            Self::Event(e) => e.wait(0),
+            Self::Semaphore(s) => s.try_acquire(),
+        }
+    }
+
     /// Block until signaled / finished. Returns `WAIT_*` codes.
     pub fn wait(&self, timeout_ms: u32) -> u32 {
         match self {
@@ -384,7 +541,106 @@ impl WaitTarget {
                     WAIT_TIMEOUT
                 }
             }
+            Self::Semaphore(s) => {
+                if s.wait(timeout_ms) {
+                    WAIT_OBJECT_0
+                } else {
+                    WAIT_TIMEOUT
+                }
+            }
         }
+    }
+}
+
+/// Maximum handles for `WaitForMultipleObjects` (Windows `MAXIMUM_WAIT_OBJECTS`).
+pub const MAXIMUM_WAIT_OBJECTS: usize = 64;
+
+/// Wait on multiple detached targets (any or all). Parks with short polls so
+/// the process lock is never held while sleeping.
+///
+/// Returns `WAIT_OBJECT_0 + index` for wait-any, `WAIT_OBJECT_0` for wait-all,
+/// or `WAIT_TIMEOUT` / `WAIT_FAILED`.
+pub fn wait_multiple(targets: &[WaitTarget], wait_all: bool, timeout_ms: u32) -> u32 {
+    if targets.is_empty() || targets.len() > MAXIMUM_WAIT_OBJECTS {
+        return WAIT_FAILED;
+    }
+
+    if let Some(code) = multi_try_once(targets, wait_all) {
+        return code;
+    }
+    if timeout_ms == 0 {
+        return WAIT_TIMEOUT;
+    }
+
+    let infinite = timeout_ms == INFINITE;
+    let deadline = if infinite {
+        None
+    } else {
+        Some(
+            std::time::Instant::now()
+                .checked_add(Duration::from_millis(u64::from(timeout_ms)))
+                .unwrap_or_else(std::time::Instant::now),
+        )
+    };
+
+    loop {
+        if let Some(code) = multi_try_once(targets, wait_all) {
+            return code;
+        }
+        if let Some(dl) = deadline
+            && std::time::Instant::now() >= dl
+        {
+            return WAIT_TIMEOUT;
+        }
+
+        let slice_ms: u32 = if let Some(dl) = deadline {
+            let rem = dl.saturating_duration_since(std::time::Instant::now());
+            u32::try_from(rem.as_millis().min(25)).unwrap_or(25).max(1)
+        } else {
+            25
+        };
+
+        if wait_all {
+            // Avoid consuming auto-reset units while not all are ready.
+            std::thread::sleep(Duration::from_millis(u64::from(slice_ms.min(5))));
+        } else if let Some(first) = targets.first() {
+            // Park on the first object; if it signals, that is index 0.
+            if first.wait(slice_ms) == WAIT_OBJECT_0 {
+                return WAIT_OBJECT_0;
+            }
+            // Else re-poll the whole set (another handle may have signaled).
+        } else {
+            return WAIT_FAILED;
+        }
+    }
+}
+
+/// One non-blocking multi-wait attempt. `Some` if satisfied.
+fn multi_try_once(targets: &[WaitTarget], wait_all: bool) -> Option<u32> {
+    if wait_all {
+        // Threads: readiness is non-destructive. Events/semaphores consume on
+        // acquire — only acquire after every thread is finished; if a later
+        // acquire fails, earlier units stay taken (emulator limitation).
+        for t in targets {
+            if let WaitTarget::Thread(th) = t
+                && !th.is_finished()
+            {
+                return None;
+            }
+        }
+        for t in targets {
+            if !t.try_wait() {
+                return None;
+            }
+        }
+        Some(WAIT_OBJECT_0)
+    } else {
+        for (i, t) in targets.iter().enumerate() {
+            if t.try_wait() {
+                return Some(WAIT_OBJECT_0.saturating_add(u32::try_from(i).unwrap_or(0)));
+            }
+        }
+        None
     }
 }
 
@@ -394,6 +650,16 @@ impl SyncState {
         match self.objects.get(&handle)? {
             KernelObject::Thread(t) => Some(WaitTarget::Thread(Arc::clone(t))),
             KernelObject::Event(e) => Some(WaitTarget::Event(Arc::clone(e))),
+            KernelObject::Semaphore(s) => Some(WaitTarget::Semaphore(Arc::clone(s))),
         }
+    }
+
+    /// Build wait targets for a handle list; `None` if any handle is invalid.
+    pub fn wait_targets(&self, handles: &[u64]) -> Option<Vec<WaitTarget>> {
+        let mut out = Vec::with_capacity(handles.len());
+        for &h in handles {
+            out.push(self.wait_target(h)?);
+        }
+        Some(out)
     }
 }

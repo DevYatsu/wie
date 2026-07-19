@@ -5277,53 +5277,84 @@ pub fn handle_format_message_w(
     ret_u64(engine, 0, "FormatMessageW")
 }
 
-/// `DWORD ResumeThread(HANDLE)`.
+/// `DWORD ResumeThread(HANDLE)` — start a `CREATE_SUSPENDED` worker.
 pub fn handle_resume_thread(
     engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _thread = engine.read_rcx()?;
-    // Previous suspend count = 1 (was suspended once).
-    ret_u64(engine, 1, "ResumeThread")
+    let handle = engine.read_rcx()?;
+    // Previous suspend count: 1 if we had it suspended, 0 if already running, -1 on error.
+    if let Some(spawn) = state.sync.suspended_spawns.remove(&handle) {
+        state.sync.pending_spawns.push(spawn);
+        state.last_error = 0;
+        return ret_u64(engine, 1, "ResumeThread");
+    }
+    if state.sync.thread_by_handle(handle).is_some() {
+        // Already running (or finished) — suspend count was 0.
+        state.last_error = 0;
+        return ret_u64(engine, 0, "ResumeThread");
+    }
+    state.last_error = ERROR_INVALID_HANDLE;
+    // `(DWORD)-1`
+    ret_u64(engine, u64::from(u32::MAX), "ResumeThread")
 }
 
-/// `HANDLE CreateSemaphoreW(...)` — soft handle via event-like object.
+/// `HANDLE CreateSemaphoreA/W(...)` — counting semaphore waitable.
 pub fn handle_create_semaphore(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    // Reuse CreateEvent machinery: a semaphore with count is modelled as an event for waits.
     let _attrs = engine.read_rcx()?;
-    let _initial = engine.read_rdx()?;
-    let _maximum = engine.read_r8()?;
-    let _name = engine.read_r9()?;
-    // Allocate a fresh waitable handle via create_event path (manual-reset false, signaled).
-    handle_create_event_simple(engine, state, false, true)
-}
-
-fn handle_create_event_simple(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-    manual_reset: bool,
-    initial_state: bool,
-) -> Result<WinApiHandlerResult> {
-    let (handle, _) = state.sync.register_event(manual_reset, initial_state);
+    let initial_raw = engine.read_rdx()?;
+    let maximum_raw = engine.read_r8()?;
+    let _name = engine.read_r9()?; // named: ignore (anonymous only)
+    let initial = i32::from_le_bytes(
+        u32::try_from(initial_raw & 0xffff_ffff)
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    let maximum = i32::from_le_bytes(
+        u32::try_from(maximum_raw & 0xffff_ffff)
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    if maximum <= 0 || initial < 0 || initial > maximum {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        return ret_u64(engine, 0, "CreateSemaphore");
+    }
+    let (handle, _) = state.sync.register_semaphore(initial, maximum);
     state.last_error = 0;
-    ret_u64(engine, handle, "CreateSemaphore/Event")
+    ret_u64(engine, handle, "CreateSemaphore")
 }
 
 /// `BOOL ReleaseSemaphore(HANDLE, LONG, LPLONG)`.
 pub fn handle_release_semaphore(
     engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _handle = engine.read_rcx()?;
-    let _release = engine.read_rdx()?;
-    let prev = engine.read_r8()?;
-    if prev != 0 {
-        write_guest_u32(engine, prev, 0)?;
+    let handle = engine.read_rcx()?;
+    let release_raw = engine.read_rdx()?;
+    let prev_out = engine.read_r8()?;
+    let release = i32::from_le_bytes(
+        u32::try_from(release_raw & 0xffff_ffff)
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    let Some(crate::KernelObject::Semaphore(sem)) = state.sync.object(handle).cloned() else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        return ret_u64(engine, 0, "ReleaseSemaphore");
+    };
+    if let Some(prev) = sem.release(release) {
+        if prev_out != 0 {
+            let prev_u = u32::from_ne_bytes(prev.to_ne_bytes());
+            write_guest_u32(engine, prev_out, prev_u)?;
+        }
+        state.last_error = 0;
+        ret_u64(engine, 1, "ReleaseSemaphore")
+    } else {
+        state.last_error = ERROR_TOO_MANY_POSTS;
+        ret_u64(engine, 0, "ReleaseSemaphore")
     }
-    ret_bool_true(engine, "ReleaseSemaphore")
 }
 
 /// `HANDLE OpenEventW(DWORD, BOOL, LPCWSTR)`.
@@ -5334,32 +5365,65 @@ pub fn handle_open_event(
     let _access = engine.read_rcx()?;
     let _inherit = engine.read_rdx()?;
     let _name = engine.read_r9().or_else(|_| engine.read_r8())?;
-    // Not found for named events in prototype.
-    let _ = state;
+    // Named events not supported yet.
+    state.last_error = ERROR_FILE_NOT_FOUND;
     ret_u64(engine, 0, "OpenEventW")
 }
 
-/// `DWORD WaitForMultipleObjects(...)` — wait-all / any on soft waitables.
+/// `DWORD WaitForMultipleObjects(...)` — wait-all / any on kernel waitables.
 pub fn handle_wait_for_multiple_objects(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    const WAIT_OBJECT_0: u64 = 0;
-    const WAIT_FAILED: u64 = 0xffff_ffff;
     let count = low_u32(engine.read_rcx()?, "WaitForMultipleObjects count")?;
     let handles_ptr = engine.read_rdx()?;
     let wait_all = (engine.read_r8()? & 0xffff_ffff) != 0;
-    let _timeout = engine.read_r9()?;
-    if count == 0 || handles_ptr == 0 || count > 64 {
-        return ret_u64(engine, WAIT_FAILED, "WaitForMultipleObjects");
+    let timeout_raw = engine.read_r9()?;
+    let timeout_ms = u32::try_from(timeout_raw & u64::from(u32::MAX)).unwrap_or(0);
+
+    let count_usize = usize::try_from(count).unwrap_or(usize::MAX);
+    if count == 0 || handles_ptr == 0 || count_usize > crate::MAXIMUM_WAIT_OBJECTS {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        return ret_u64(engine, u64::from(crate::WAIT_FAILED), "WaitForMultipleObjects");
     }
-    // Prototype: best-effort success at index 0 (real wait is handled by single-object path).
-    let _ = (wait_all, state);
+
+    let mut handles = Vec::with_capacity(count_usize);
     for i in 0..count {
         let ha = handles_ptr.wrapping_add(u64::from(i).wrapping_mul(8));
-        let _h = read_guest_u64(engine, ha)?;
+        handles.push(read_guest_u64(engine, ha)?);
     }
-    ret_u64(engine, WAIT_OBJECT_0, "WaitForMultipleObjects")
+
+    // Fast path: already satisfied (no host park).
+    if let Some(targets) = state.sync.wait_targets(&handles) {
+        let result = crate::wait_multiple(&targets, wait_all, 0);
+        if result != crate::WAIT_TIMEOUT {
+            state.last_error = 0;
+            return ret_u64(engine, u64::from(result), "WaitForMultipleObjects");
+        }
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        return ret_u64(engine, u64::from(crate::WAIT_FAILED), "WaitForMultipleObjects");
+    }
+
+    if timeout_ms == 0 {
+        state.last_error = 0;
+        return ret_u64(engine, u64::from(crate::WAIT_TIMEOUT), "WaitForMultipleObjects");
+    }
+
+    // Stash args per waiter TID; HostPark reason stays small/Copy.
+    let waiter = state.threads.current_tid();
+    state.sync.multi_wait.insert(
+        waiter,
+        crate::sync_obj::MultiWaitRequest {
+            handles,
+            wait_all,
+            timeout_ms,
+        },
+    );
+    Err(crate::WinApiControlSignal::HostPark {
+        reason: crate::HostParkReason::WaitMultiple,
+    }
+    .into())
 }
 
 /// `BOOL MoveFileWithProgressW` — alias MoveFileW semantics.
@@ -5550,8 +5614,11 @@ pub fn dispatch_kernel32_extra(
     }
 }
 
-/// Default worker stack size (64 KiB) when `dwStackSize == 0`.
-const DEFAULT_WORKER_STACK: usize = 0x1_0000;
+/// Default worker stack size when `dwStackSize == 0`.
+///
+/// Matches the common Windows default commit size (1 MiB) rather than a tiny
+/// micro-test stack — real PE tools (compressors, CRT workers) need room.
+const DEFAULT_WORKER_STACK: usize = 0x10_0000;
 /// Guest VA region for worker stacks (distinct from primary stack at 0x2000_0000).
 const WORKER_STACK_REGION_BASE: u64 = 0x0000_0000_2200_0000;
 const WORKER_STACK_STRIDE: u64 = 0x0000_0000_0020_0000;
@@ -5953,49 +6020,49 @@ fn handle_create_thread(
     let flags = read_create_file_stack_u32(engine, 0x28).unwrap_or(0);
     let tid_out = read_stack_u64(engine, 0x30).unwrap_or(0);
 
+    let handle = create_guest_thread(engine, state, stack_size_raw, start, param, flags, tid_out)?;
+    let return_address = engine.return_from_win64_api(handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: handle,
+    })
+}
+
+/// Shared guest-thread spawn for `CreateThread` and CRT `_beginthreadex`.
+///
+/// Returns the kernel handle, or `0` with `state.last_error` set on failure.
+/// Does **not** pop the Win64 API frame (caller completes the return).
+pub fn create_guest_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    stack_size_raw: u64,
+    start: u64,
+    param: u64,
+    flags: u32,
+    tid_out: u64,
+) -> Result<u64> {
     if !mt_create_thread_enabled() {
         state.last_error = ERROR_NOT_SUPPORTED_MT;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return Ok(0);
     }
 
     if start == 0 {
         state.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return Ok(0);
     }
 
-    // Cap workers: by_tid includes primary, so workers = len - 1 + pending.
+    // Cap workers: by_tid includes primary; count pending + suspended too.
     let live_workers = state
         .threads
         .by_tid
         .len()
         .saturating_sub(1)
-        .saturating_add(state.sync.pending_spawns.len());
+        .saturating_add(state.sync.pending_spawns.len())
+        .saturating_add(state.sync.suspended_spawns.len());
     let max = usize::try_from(mt_max_worker_threads()).unwrap_or(64);
     if live_workers >= max {
         state.last_error = ERROR_NOT_ENOUGH_MEMORY;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
-    }
-
-    if (flags & CREATE_SUSPENDED) != 0 {
-        // Suspended create not required for MT.2 micros; refuse cleanly.
-        state.last_error = ERROR_INVALID_PARAMETER;
-        let return_address = engine.return_from_win64_api(0)?;
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
+        return Ok(0);
     }
 
     let stack_size = if stack_size_raw == 0 {
@@ -6031,11 +6098,7 @@ fn handle_create_thread(
             .is_err()
         {
             state.last_error = ERROR_NOT_ENOUGH_MEMORY;
-            let return_address = engine.return_from_win64_api(0)?;
-            return Ok(WinApiHandlerResult {
-                return_address,
-                return_value: 0,
-            });
+            return Ok(0);
         }
         stack_base
     };
@@ -6043,8 +6106,8 @@ fn handle_create_thread(
     let stack_top = stack_base.saturating_add(u64::try_from(stack_size).unwrap_or(0));
     let aligned_top = stack_top & !0xF_u64;
     // At ThreadProc entry: [RSP]=retaddr, RSP%16==8 (as after CALL).
+    // Retaddr 0 → worker loop treats RIP=0 as natural exit (exit code from RAX).
     let entry_rsp = aligned_top.saturating_sub(8);
-    // Dummy return address (worker must ExitThread; returning faults).
     drop(engine.mem_write(entry_rsp, &0_u64.to_le_bytes()));
 
     let tid = state.threads.alloc_worker();
@@ -6059,30 +6122,33 @@ fn handle_create_thread(
     ctx.rip = start;
 
     let (handle, _obj) = state.sync.register_thread(tid, ctx);
-    state.sync.pending_spawns.push(crate::PendingSpawn {
+    let spawn = crate::PendingSpawn {
         tid,
         handle,
         start_address: start,
         parameter: param,
         stack_base,
         stack_size,
-    });
+    };
+    if (flags & CREATE_SUSPENDED) != 0 {
+        state.sync.suspended_spawns.insert(handle, spawn);
+    } else {
+        state.sync.pending_spawns.push(spawn);
+    }
 
     if tid_out != 0 {
         drop(engine.mem_write(tid_out, &tid.to_le_bytes()));
     }
 
     state.last_error = 0;
-    let return_address = engine.return_from_win64_api(handle)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
+    Ok(handle)
 }
 
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 /// `ERROR_NOT_SUPPORTED` — used when `WIE_MT=0` refuses `CreateThread`.
 const ERROR_NOT_SUPPORTED_MT: u32 = 50;
+/// `ERROR_TOO_MANY_POSTS` — semaphore release would exceed maximum.
+const ERROR_TOO_MANY_POSTS: u32 = 298;
 
 fn read_stack_u64(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u64> {
     let rsp = engine.read_rsp()?;
@@ -6148,7 +6214,7 @@ fn handle_get_exit_code_thread(
     })
 }
 
-/// `WaitForSingleObject` — thread or event (MT.2/3).
+/// `WaitForSingleObject` — thread, event, or semaphore (MT.2/3).
 fn handle_wait_for_single_object(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -6171,8 +6237,18 @@ fn handle_wait_for_single_object(
             }
         }
         Some(crate::KernelObject::Event(e)) => {
-            // Non-blocking check
             if e.wait(0) {
+                state.last_error = 0;
+                let return_address =
+                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: u64::from(crate::WAIT_OBJECT_0),
+                });
+            }
+        }
+        Some(crate::KernelObject::Semaphore(s)) => {
+            if s.try_acquire() {
                 state.last_error = 0;
                 let return_address =
                     engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;

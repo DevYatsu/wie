@@ -108,20 +108,22 @@ if [[ ! -f "$DRIVE_D/vfs_out.txt" ]]; then
   echo "FAIL: vfs_out.txt not written back to host D:" >&2
   exit 1
 fi
-if ! grep -q '---WIE_VFS---' "$DRIVE_D/vfs_out.txt"; then
+# BSD grep (macOS) treats a pattern that starts with `-` as options unless
+# `--` or `-e` is used. Stamp is `---WIE_VFS---` — fixed-string + end-of-opts.
+if ! grep -Fq -- '---WIE_VFS---' "$DRIVE_D/vfs_out.txt"; then
   echo "FAIL: vfs_out.txt missing stamp" >&2
   exit 1
 fi
 # Unicode must survive (UTF-8 substrings).
-if ! grep -q 'Привет' "$DRIVE_D/vfs_out.txt"; then
+if ! grep -Fq -- 'Привет' "$DRIVE_D/vfs_out.txt"; then
   echo "FAIL: Russian missing in host output" >&2
   exit 1
 fi
-if ! grep -q '你好' "$DRIVE_D/vfs_out.txt"; then
+if ! grep -Fq -- '你好' "$DRIVE_D/vfs_out.txt"; then
   echo "FAIL: Chinese missing in host output" >&2
   exit 1
 fi
-if ! grep -q '日本語' "$DRIVE_D/vfs_out.txt"; then
+if ! grep -Fq -- '日本語' "$DRIVE_D/vfs_out.txt"; then
   echo "FAIL: Japanese missing in host output" >&2
   exit 1
 fi

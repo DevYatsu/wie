@@ -17,6 +17,10 @@
 
 **1:1 host thread ↔ guest thread.** Guest execution is **serialized** on one shared `CpuEngine` (process mutex). Host wait (`WaitFor*`, contended CS, `Sleep`) **drops** the engine lock so other guest threads can run. This preserves single-thread speed until the first `CreateThread` (local engine, no mutex).
 
+Thread switch always **saves** the previous guest CPU context before restoring the next (`activate_thread`); otherwise a worker that wins the process lock between primary quanta would clobber unsaved primary registers.
+
+Default **guest** worker stack is **1 MiB** when `dwStackSize == 0` (Windows-like). Host OS threads for workers use an **8 MiB** stack so JIT/iced dispatch does not overflow secondary-thread defaults on macOS.
+
 True parallel guest data planes (two cores in JIT simultaneously) remain a future step; metadata is already MT-ready (`mem_gen` atomic, Interlocked host atomics, wake-all on `ExitProcess`).
 
 ## What works
@@ -30,6 +34,8 @@ True parallel guest data planes (two cores in JIT simultaneously) remain a futur
 ### MT.2
 
 - `CreateThread` — stack alloc, TID/handle, host `std::thread` worker  
+- CRT `_beginthreadex` / `_endthreadex` — same spawn path as `CreateThread`  
+- `CREATE_SUSPENDED` + `ResumeThread`  
 - `ExitThread` / `GetExitCodeThread`  
 - `WaitForSingleObject` on thread handles (join)  
 - `CloseHandle` on thread objects  
@@ -39,7 +45,9 @@ True parallel guest data planes (two cores in JIT simultaneously) remain a futur
 
 - Contended CS: host park on CS condvar; Leave wakes one waiter  
 - `CreateEventA/W`, `SetEvent`, `ResetEvent`  
-- `WaitForSingleObject` on events  
+- Counting `CreateSemaphoreA/W` + `ReleaseSemaphore`  
+- `WaitForSingleObject` on events / semaphores  
+- `WaitForMultipleObjects` (wait-any / wait-all, host park outside process locks)  
 - Micros: `cs_two_threads.exe`, `event_handshake.exe`  
 
 ### MT.4
@@ -66,9 +74,9 @@ Suite: `scripts/run-micro-suite.sh` runs MT micros; `mt_stress` is skipped when 
 ## Explicit non-goals (still)
 
 - Concurrent unlocked guest data planes (true parallel JIT on two cores)  
-- `CREATE_SUSPENDED` / `ResumeThread`  
 - Multi-TEB / GS base  
-- Named events, mutex objects, `WaitForMultipleObjects`  
+- Named events / named semaphores / mutex objects  
+- Perfect wait-all rollback when auto-reset objects are mixed in the set  
 - APC / alertable waits / fibers  
 
 ## ARM notes

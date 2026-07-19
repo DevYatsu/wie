@@ -54,6 +54,13 @@ mkdir -p "$BOTTLE/drive_c/App"
 
 # Optional host bridge: guest D:\… → host path (WIE_DRIVE_D / --drive-d)
 # ./target/release/wie-cli run --root "$BOTTLE" --drive-d "$PWD/data" real_exes/7za.exe -- a C:\App\out.7z D:\sample.txt
+
+# Multithreading micros (CreateThread / CS / events / Interlocked)
+./target/release/wie-cli run micro-exes/out/thread_create_join.exe
+./target/release/wie-cli run micro-exes/out/cs_two_threads.exe
+./target/release/wie-cli run micro-exes/out/event_handshake.exe
+./target/release/wie-cli run micro-exes/out/mt_stress.exe
+# Kill-switch: WIE_MT=0 makes CreateThread fail (ST-only)
 ```
 
 ```bash
@@ -68,6 +75,29 @@ WIE_JIT_CHAIN=0  ./scripts/run-micro-suite.sh
 WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 ```
 
+## Multithreading (guest threads)
+
+WIE models **1:1 host thread ↔ guest thread**. Guest **CPU is still serialized** on one shared `CpuEngine` (process mutex): when a thread waits (`WaitFor*`, contended CS, …) it **drops** the engine lock so peers can run. True parallel JIT on two cores is a future step. Details: [`docs/mt-threads.md`](docs/mt-threads.md).
+
+| Surface | Status |
+| ------- | ------ |
+| `CreateThread` / `ExitThread` / join via `WaitForSingleObject` | OK |
+| CRT `_beginthreadex` / `_endthreadex` (same spawn path) | OK |
+| `CREATE_SUSPENDED` + `ResumeThread` | OK |
+| Critical sections (reenter + contended park) | OK |
+| Events (`CreateEvent` / `Set` / `Reset` / wait) | OK |
+| Semaphores (`CreateSemaphore` / `ReleaseSemaphore` / wait) | OK |
+| `WaitForMultipleObjects` (any / all) | OK |
+| Interlocked\* (host atomics when aligned + soft-translated) | OK |
+| TLS (`TlsAlloc` / `Get` / `Set` / `Free`) | OK |
+
+| Knob | Role | Default |
+| ---- | ---- | ------- |
+| `WIE_MT=0` | Disable worker spawn (`CreateThread` → fail) | enabled |
+| `WIE_MT_MAX_THREADS` | Cap on guest workers | `64` |
+
+Default **guest** worker stack is **1 MiB** when `dwStackSize == 0`. Host OS threads for workers use **8 MiB** (JIT/iced need room on secondary threads).
+
 ## 7-Zip console status (`7za`)
 
 WIE emulates a **Windows PE64** standalone console 7-Zip (`7za.exe` from the official **7-Zip Extra** package). That is **not** a native macOS `7za`/`7z` binary and **not** the GUI (`7zFM` / full installer).
@@ -77,15 +107,19 @@ WIE emulates a **Windows PE64** standalone console 7-Zip (`7za.exe` from the off
 
 ### What works (verified with 7-Zip Extra **26.02** `x64/7za.exe`)
 
-| Guest command        | Meaning                    | Default JIT | `WIE_CPU=iced`          |
-| -------------------- | -------------------------- | ----------- | ----------------------- |
-| `--help` / `help`    | Usage                      | OK `exit=0` | OK                      |
-| `i`                  | Formats / codecs / hashers | OK          | OK                      |
-| `a -mmt1 -bd …`      | Create `.7z` (LZMA2)       | OK          | OK                      |
-| `l …`                | List archive               | OK          | OK                      |
-| `x -mmt1 -bd -y -o…` | Extract                    | OK          | OK (SHA matches source) |
+| Guest command        | Meaning                         | Default JIT | `WIE_CPU=iced`          |
+| -------------------- | ------------------------------- | ----------- | ----------------------- |
+| `--help` / `help`    | Usage                           | OK `exit=0` | OK                      |
+| `i`                  | Formats / codecs / hashers      | OK          | OK                      |
+| `a -mmt1 -bd …`      | Create `.7z` (LZMA2, 1 thread)  | OK          | OK                      |
+| `a -mmt2` / `-mmt4`  | Multi-thread create (CRT MT)    | OK          | OK                      |
+| `l …`                | List archive                    | OK          | OK                      |
+| `x -mmt1 -bd -y -o…` | Extract                         | OK          | OK (SHA matches source) |
+| `x -mmt2` / `-mmt4`  | Multi-thread extract + roundtrip| OK          | OK                      |
 
-Recommended flags: **`-mmt1`** (one compression thread), **`-bd`** (no progress), **`-y`** on extract. Raise **`--max-api`** for real tools (`200000`–`500000`); micros keep the low default.
+7za multi-thread paths use **`msvcrt!_beginthreadex`**, events, and semaphores — the same generic WinAPI/CRT surface as the MT micros (not a 7za special case).
+
+Recommended flags: **`-bd`** (no progress), **`-y`** on extract. Raise **`--max-api`** for real tools (`200000`–`500000`); micros keep the low default.
 
 ### Obtain Windows `7za.exe` (any Mac)
 
@@ -128,7 +162,9 @@ Generate inputs on the fly (no personal `Downloads/` files, works in CI):
 | Binary blob (~256 KiB) | Python deterministic bytes | LZMA2 + SHA-256 roundtrip    |
 | Optional extra         | `cp /any/local/file …`     | Stress only; not required    |
 
-### Reproduce (after `real_exes/7za.exe` is present)
+### Universal example (create / list / extract / MT / SHA roundtrip)
+
+One bottle, synthetic payloads only (no personal files). After `real_exes/7za.exe` is present:
 
 ```bash
 cargo build -p wie-cli --release
@@ -150,28 +186,37 @@ data = bytes((i * 17 + 31) & 0xFF for i in range(256 * 1024))
 print('blob.bin', len(data))
 "
 
+# Help + codec inventory
 $CLI run --root "$BOTTLE" --max-api 100000 "$PE" -- --help
 $CLI run --root "$BOTTLE" --max-api 100000 "$PE" -- i
 
+# Create: single-thread + multi-thread (CRT _beginthreadex path)
 $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
   a -mmt1 -bd 'C:\App\hello.7z' 'C:\App\hello.txt'
 $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
-  a -mmt1 -bd 'C:\App\blob.7z' 'C:\App\blob.bin'
+  a -mmt2 -bd 'C:\App\blob.7z' 'C:\App\blob.bin'
+$CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
+  a -mmt4 -bd 'C:\App\blob4.7z' 'C:\App\blob.bin'
 
+# List
 $CLI run --root "$BOTTLE" --max-api 100000 "$PE" -- l 'C:\App\blob.7z'
 
+# Extract + SHA-256 roundtrip (mmt2)
 rm -rf "$APP/out" && mkdir -p "$APP/out"
 $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
-  x -mmt1 -bd -y -o'C:\App\out' 'C:\App\blob.7z'
+  x -mmt2 -bd -y -o'C:\App\out' 'C:\App\blob.7z'
 SRC=$(shasum -a 256 "$APP/blob.bin" | awk '{print $1}')
 OUT=$(shasum -a 256 "$APP/out/blob.bin" | awk '{print $1}')
 echo "src=$SRC out=$OUT"
 test "$SRC" = "$OUT" && echo "ROUNDTRIP OK" || { echo "ROUNDTRIP FAIL"; exit 1; }
 
+# Backend A/B (optional)
 WIE_CPU=iced $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
-  a -mmt1 -bd 'C:\App\blob_iced.7z' 'C:\App\blob.bin'
+  a -mmt2 -bd 'C:\App\blob_iced.7z' 'C:\App\blob.bin'
 WIE_CPU=jit  $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
-  a -mmt1 -bd 'C:\App\blob_jit.7z'  'C:\App\blob.bin'
+  a -mmt2 -bd 'C:\App\blob_jit.7z'  'C:\App\blob.bin'
+
+rm -rf "$BOTTLE"
 ```
 
 **CLI shape:**
@@ -180,7 +225,7 @@ WIE_CPU=jit  $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
 wie-cli run --root <bottle> --max-api N real_exes/7za.exe -- <7za-args...>
 ```
 
-**Minimal smoke (text only):**
+**Minimal smoke (text only, single-thread):**
 
 ```bash
 cargo build -p wie-cli --release
@@ -195,17 +240,17 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
   cat "$B/drive_c/App/out/hello.txt" && rm -rf "$B"
 ```
 
-### Implementation notes (why create works)
+### Implementation notes (why real tools work)
 
 1. **`SBB` flags** — MSVC COM `QueryInterface` uses `cmp` + `sbb r,r` + `sbb r,-1`. Wrong CF when `src+CF` overflowed the operand width picked the wrong interface → null call.
 2. **`VirtualAlloc(NULL, size, MEM_COMMIT)`** — treated as **RESERVE|COMMIT** (Windows/Wine-compatible) for LZMA2 buffers.
 3. **JIT dual_super GPR writeback** — only store live GPRs on block exit (do not zero callee-saved).
 4. **Default `WIE_JIT_SUPER=loop`** — non-loop stack super can host-fault on some real tools (`7za a`); self-loop super keeps `long_loop` fast. Opt in with `WIE_JIT_SUPER=all` only when bisecting.
+5. **CRT/WinAPI MT** — `_beginthreadex`, semaphores, events, `WaitForMultipleObjects`, save-before-switch on the shared engine (see Multithreading above).
 
 ### Not claimed yet
 
 - GUI 7-Zip / `7zFM` / full installer PE.
-- Multi-thread compression (`-mmt` &gt; 1) as a supported matrix.
 - Password / crypto, solid multi-file update, or every format beyond default `.7z` LZMA2.
 
 ## Core Components
@@ -283,6 +328,8 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
 | `WIE_IDLE_PARK_MS`                        | Empty-`GetMessage` park quantum ms (default 25)                                                     |
 | `WIE_IDLE_MAX_PARKS`                      | Max message park quanta before CLI yield (`0` = unlimited; default 40)                              |
 | `WIE_HOST_SLEEP=1`                        | **Legacy:** enable `Sleep(n>0)` park only (prefer `WIE_IDLE=park`)                                  |
+| `WIE_MT=0`                                | Disable guest worker spawn (`CreateThread` / `_beginthreadex` fail)                                 |
+| `WIE_MT_MAX_THREADS`                      | Cap on guest worker threads (default **64**)                                                        |
 | `RUST_LOG`                                | tracing filter (CLI defaults to `warn`)                                                             |
 
 ## CLI

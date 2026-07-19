@@ -107,6 +107,7 @@ pub fn dispatch_ucrt(
         "wcsstr" => handle_wcsstr(engine),
         "_onexit" | "__dllonexit" => handle_onexit(engine),
         "_beginthreadex" => handle_begin_thread_ex(engine, state),
+        "_endthreadex" => handle_end_thread_ex(engine, state),
         "_purecall" => handle_purecall(engine),
         // MSVC C++ mangled names (matched after to_ascii_lowercase).
         "?terminate@@yaxxz" => handle_terminate_cxx(engine),
@@ -788,19 +789,64 @@ fn handle_onexit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     ret(engine, func)
 }
 
-/// `_beginthreadex` — map to soft CreateThread-like failure for now (return 0).
+/// `_beginthreadex` — same worker spawn path as `CreateThread` (MSVC CRT).
 ///
-/// Full CRT thread start needs a guest bridge; 7za often falls back to single-thread.
+/// ABI (x64): security, stack_size, start, arg, initflag, thrdaddr — identical
+/// layout to `CreateThread` for the args we care about.
 fn handle_begin_thread_ex(
     engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let _security = engine.read_rcx()?;
-    let _stack = engine.read_rdx()?;
-    let _start = engine.read_r8()?;
-    let _arg = engine.read_r9()?;
-    // Return NULL → caller may use CreateThread or run single-threaded.
-    ret(engine, 0)
+    let stack_size = engine.read_rdx()?;
+    let start = engine.read_r8()?;
+    let arg = engine.read_r9()?;
+    // Stack: [rsp+0x28]=initflag, [rsp+0x30]=thrdaddr (after home space).
+    let flags = read_stack_u32(engine, 0x28).unwrap_or(0);
+    let tid_out = read_stack_u64(engine, 0x30).unwrap_or(0);
+    let handle = crate::kernel32::create_guest_thread(
+        engine, state, stack_size, start, arg, flags, tid_out,
+    )?;
+    ret(engine, handle)
+}
+
+/// `_endthreadex` — terminate the current guest worker (like `ExitThread`).
+fn handle_end_thread_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let code_raw = engine.read_rcx()?;
+    let code = u32::try_from(code_raw & u64::from(u32::MAX)).unwrap_or(0);
+    let tid = state.threads.current_tid();
+    for obj in state.sync.objects.values() {
+        if let crate::KernelObject::Thread(t) = obj
+            && t.tid == tid
+        {
+            t.finish(code);
+            break;
+        }
+    }
+    Err(crate::WinApiControlSignal::ExitThread { code }.into())
+}
+
+fn read_stack_u32(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u32> {
+    let rsp = engine.read_rsp()?;
+    let address = rsp
+        .checked_add(offset)
+        .context("_beginthreadex stack arg overflow")?;
+    let mut bytes = [0_u8; 4];
+    engine.mem_read(address, &mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_stack_u64(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u64> {
+    let rsp = engine.read_rsp()?;
+    let address = rsp
+        .checked_add(offset)
+        .context("_beginthreadex stack arg overflow")?;
+    let mut bytes = [0_u8; 8];
+    engine.mem_read(address, &mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn handle_purecall(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {

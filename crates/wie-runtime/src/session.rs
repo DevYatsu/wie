@@ -1711,6 +1711,33 @@ impl RuntimeSession {
                             });
                             charged_api = charged_api.saturating_add(1);
                         }
+                        wie_winapi::HostParkReason::WaitMultiple => {
+                            let req = self.process.with_mut(|_, st| {
+                                st.sync.multi_wait.remove(&primary_tid)
+                            });
+                            let result = match req {
+                                Some(req) => {
+                                    let targets = self.process.with_mut(|_, st| {
+                                        st.sync.wait_targets(&req.handles)
+                                    });
+                                    match targets {
+                                        Some(ts) => wie_winapi::wait_multiple(
+                                            &ts,
+                                            req.wait_all,
+                                            req.timeout_ms,
+                                        ),
+                                        None => wie_winapi::WAIT_FAILED,
+                                    }
+                                }
+                                None => wie_winapi::WAIT_FAILED,
+                            };
+                            self.process.with_mut(|eng, st| {
+                                crate::mt_runtime::load_thread(eng, st, primary_tid);
+                                drop(eng.return_from_win64_api(u64::from(result)));
+                                crate::mt_runtime::save_thread(eng, st, primary_tid);
+                            });
+                            charged_api = charged_api.saturating_add(1);
+                        }
                     }
                 }
             }
