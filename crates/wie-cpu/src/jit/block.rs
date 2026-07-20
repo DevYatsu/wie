@@ -233,6 +233,24 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Rcr => shift_is_lowerable(instr),
         // Bit test operations: same operand forms as ALU (reg/mem, reg/imm).
         Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr => alu_is_lowerable(instr),
+        // Xadd: exchange and add — dst reg/mem, src must be register.
+        Mnemonic::Xadd => match (instr.op0_kind(), instr.op1_kind()) {
+            (OpKind::Register, OpKind::Register) => true,
+            (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
+            _ => false,
+        },
+        // CmpXchg: compare and exchange — dst reg/mem, src register. Complex flags.
+        Mnemonic::Cmpxchg => match (instr.op0_kind(), instr.op1_kind()) {
+            (OpKind::Register, OpKind::Register) => true,
+            (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
+            _ => false,
+        },
+        // Bsr: bit scan reverse — dst reg, src reg/mem.
+        Mnemonic::Bsr => match (instr.op0_kind(), instr.op1_kind()) {
+            (OpKind::Register, OpKind::Register) => true,
+            (OpKind::Register, OpKind::Memory) => mem_ea_ok(instr) && mem_size_ok(instr),
+            _ => false,
+        },
         Mnemonic::Cmove
         | Mnemonic::Cmovne
         | Mnemonic::Cmova
