@@ -7,7 +7,7 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKin
 /// Raised to capture longer pure loop bodies in one native frame.
 pub(super) const MAX_BLOCK_INSNS: usize = 96;
 /// Min instructions before paying Cranelift compile cost (short blocks lose wall).
-pub(super) const MIN_BLOCK_INSNS: usize = 2;
+pub(super) const MIN_BLOCK_INSNS: usize = 4;
 
 /// One decoded guest insn kept for the lowerer.
 #[derive(Debug, Clone)]
@@ -239,7 +239,7 @@ fn is_lowerable(instr: &Instruction) -> bool {
             (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
             _ => false,
         },
-        // CmpXchg: compare and exchange — dst reg/mem, src register. Complex flags.
+        // CmpXchg: compare and exchange — dst reg/mem, src register.
         Mnemonic::Cmpxchg => match (instr.op0_kind(), instr.op1_kind()) {
             (OpKind::Register, OpKind::Register) => true,
             (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),

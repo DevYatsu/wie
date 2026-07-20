@@ -5077,7 +5077,7 @@ fn lower_xadd(
     write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, sum_ext, bits)?;
 
     // Write original dst to src (operand 1) — src is always a register
-    drop(write_gpr(bcx, gpr, dirty, instr.op_register(1), dst_val));
+    write_gpr(bcx, gpr, dirty, instr.op_register(1), dst_val)?;
 
     // Set ADD flags
     *rflags = flags_add(bcx, *rflags, dst_val, src_val, sum_ext, bits.min(32));
@@ -5114,8 +5114,7 @@ fn lower_cmpxchg(
     let old_rax = gpr[0];
     let ext_dst = sext_to_i64(bcx, dst_val, bits);
     let new_rax = bcx.ins().select(eq, old_rax, ext_dst);
-    gpr[0] = new_rax;
-    dirty[0] = true;
+    write_gpr(bcx, gpr, dirty, Register::RAX, new_rax)?;
 
     // Set ZF based on comparison
     let zf_on = select_flag(bcx, eq, rflags::ZF);
@@ -5164,7 +5163,7 @@ fn lower_bsr(
 
     // Result: if zero, undefined (write 0); else write MSB index
     let result = bcx.ins().select(is_zero, zero_c, msb);
-    drop(write_gpr(bcx, gpr, dirty, instr.op_register(0), result));
+    write_gpr(bcx, gpr, dirty, instr.op_register(0), result)?;
 
     // Set ZF flag
     let zf_on = select_flag(bcx, is_zero, rflags::ZF);
