@@ -1,7 +1,7 @@
 //! Persistent `RuntimeSession`: guest setup, yield/resume, and API hook loop.
 
 use crate::hooks::{
-    SoftApiTable, build_iat_fake_api_entries, collect_stub_entries, resolve_fake_api_at,
+    RuntimeFakeApiEntry, SoftApiTable, collect_stub_entries, resolve_fake_api_at,
     resolve_import_fake_va,
 };
 use crate::memory::{
@@ -619,7 +619,10 @@ impl RuntimeSession {
         // Load PE directly into guest memory: single PE parse, writes headers +
         // sections + patches IAT in-place through the engine. Returns the section
         // map plan too — no need to re-read the file.
-        let (image_summary, pe_map_plan, patched_imports) = {
+        // Collect RuntimeFakeApiEntry during the resolution pass so we can skip
+        // the redundant build_iat_fake_api_entries call later.
+        let mut iat_entries: Vec<RuntimeFakeApiEntry> = Vec::new();
+        let (image_summary, pe_map_plan, _patched_imports) = {
             let engine_ref = &mut *engine;
             wie_pe::load_pe_direct_from_bytes(
                 &pe_bytes,
@@ -641,21 +644,28 @@ impl RuntimeSession {
                     if wie_winapi::ucrt::is_ucrt_library(&import.library)
                         && let Some(data_va) = wie_winapi::ucrt::crt_data_import_va(&name)
                     {
+                        let entry = crate::hooks::make_entry(
+                            data_va,
+                            import.library.clone(),
+                            name,
+                            import.iat_slot_va,
+                        );
+                        iat_entries.push(entry);
                         return Ok(data_va);
                     }
-                    let (va, _) = resolve_import_fake_va(
+                    let (va, entry) = resolve_import_fake_va(
                         &import.library,
                         &name,
                         import.iat_slot_va,
                         &mut soft_apis,
                     )?;
+                    iat_entries.push(entry);
                     Ok(va)
                 },
             )
             .context("failed to load PE64 image directly into guest memory")?
         };
 
-        let iat_entries = build_iat_fake_api_entries(&patched_imports);
         let fake_api_entries = collect_stub_entries(&iat_entries, &soft_apis);
 
         apply_pe_section_protects(engine.as_mut(), &pe_map_plan)

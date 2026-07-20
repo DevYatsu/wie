@@ -1,6 +1,7 @@
 //! Fake API registration and dense VA decode for the runtime hook range.
 
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::Arc;
 use wie_winapi::{
     FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export, encode_unresolved,
@@ -27,6 +28,10 @@ pub struct RuntimeFakeApiEntry {
 
     /// Hot-path classification resolved once at table build.
     pub traits: WinApiTraits,
+
+    /// Pre-computed guest stub kind, if this entry can run entirely in-guest.
+    /// Avoids re-classifying during stub planting.
+    pub(crate) stub_kind: Option<crate::guest_stubs::GuestStubKind>,
 }
 
 /// Soft (unresolved) table: indexed by dense soft payload, not a HashMap.
@@ -81,7 +86,7 @@ pub struct ResolvedFakeApi {
     pub traits: WinApiTraits,
 }
 
-fn make_entry(
+pub(crate) fn make_entry(
     fake_target_va: u64,
     library: String,
     name: String,
@@ -99,13 +104,13 @@ fn make_entry(
         traits = WinApiTraits::EMPTY.with_exit_process();
     }
     // Align traits with planted guest stubs even if WinApiId map is incomplete.
-    if crate::guest_stubs::classify_guest_stub(
+    // Cache the stub kind so plant_guest_stubs doesn't re-classify.
+    let stub_kind = crate::guest_stubs::classify_guest_stub(
         &library,
         &name,
         &crate::guest_stubs::GuestStubConfig::CLASSIFY_ONLY,
-    )
-    .is_some()
-    {
+    );
+    if stub_kind.is_some() {
         traits.set_guest_stub(true);
         traits.set_noisy(true);
     }
@@ -117,6 +122,7 @@ fn make_entry(
         iat_slot_va,
         winapi_id,
         traits,
+        stub_kind,
     }
 }
 
@@ -134,24 +140,11 @@ pub fn resolve_import_fake_va(
     soft.intern(library, name, iat_slot_va)
 }
 
-/// Build IAT-side entry list for guest stubs / rewire (not used for hot-path lookup).
-pub(crate) fn build_iat_fake_api_entries(
-    patched_imports: &[wie_pe::PePatchedImport],
-) -> Vec<RuntimeFakeApiEntry> {
-    patched_imports
-        .iter()
-        .map(|import| {
-            make_entry(
-                import.fake_target_va,
-                import.library.clone(),
-                import.name.clone(),
-                import.iat_slot_va,
-            )
-        })
-        .collect()
-}
-
 /// O(1) decode of a host-stop address into dispatch metadata.
+///
+/// Traits (guest_stub, noisy, exit_process, …) are pre-computed by `make_entry`
+/// and embedded in `WinApiId::traits()` for Export entries — no need to
+/// re-classify guest stubs on the hot path.
 pub(crate) fn resolve_fake_api_at(
     address: u64,
     soft: &SoftApiTable,
@@ -161,23 +154,11 @@ pub(crate) fn resolve_fake_api_at(
     match decoded {
         FakeVa::Export(id) | FakeVa::Alias(id) => {
             let (lib, name) = winapi_id_export(id).unwrap_or(("unknown.dll", "unknown"));
-            let mut traits = id.traits();
-            // Preserve exit-process for ExitProcess if ever given an id; CRT exits stay soft.
-            if crate::guest_stubs::classify_guest_stub(
-                lib,
-                name,
-                &crate::guest_stubs::GuestStubConfig::CLASSIFY_ONLY,
-            )
-            .is_some()
-            {
-                traits.set_guest_stub(true);
-                traits.set_noisy(true);
-            }
             Some(ResolvedFakeApi {
                 library: Arc::<str>::from(lib),
                 name: Arc::<str>::from(name),
                 winapi_id: Some(id),
-                traits,
+                traits: id.traits(),
             })
         }
         FakeVa::Unresolved(index) => {
@@ -223,13 +204,22 @@ fn resolve_com(iface: u8, method: u8) -> Option<ResolvedFakeApi> {
 }
 
 /// Collect every known plantable entry for guest stubs: IAT + soft table uniques.
+///
+/// Uses a [`HashSet`] of known VAs for O(n+m) dedup instead of O(n×m) linear scan.
 pub(crate) fn collect_stub_entries(
     iat_entries: &[RuntimeFakeApiEntry],
     soft: &SoftApiTable,
 ) -> Vec<RuntimeFakeApiEntry> {
-    let mut out = iat_entries.to_vec();
+    let soft_len = soft.as_slice().len();
+    let mut seen = HashSet::with_capacity(iat_entries.len().max(soft_len));
+    let mut out = Vec::with_capacity(iat_entries.len().max(soft_len));
+
+    for e in iat_entries {
+        seen.insert(e.fake_target_va);
+        out.push(e.clone());
+    }
     for e in soft.as_slice() {
-        if !out.iter().any(|x| x.fake_target_va == e.fake_target_va) {
+        if seen.insert(e.fake_target_va) {
             out.push(e.clone());
         }
     }
