@@ -7,7 +7,7 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKin
 /// Raised to capture longer pure loop bodies in one native frame.
 pub(super) const MAX_BLOCK_INSNS: usize = 96;
 /// Min instructions before paying Cranelift compile cost (short blocks lose wall).
-pub(super) const MIN_BLOCK_INSNS: usize = 8;
+pub(super) const MIN_BLOCK_INSNS: usize = 2;
 
 /// One decoded guest insn kept for the lowerer.
 #[derive(Debug, Clone)]
@@ -220,6 +220,7 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Cmp
         | Mnemonic::Test => alu_is_lowerable(instr),
         Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
+        Mnemonic::Cwde | Mnemonic::Cdqe => true, // register-only sign-extension
         Mnemonic::Imul => imul_is_lowerable(instr),
         Mnemonic::Xchg => xchg_is_lowerable(instr),
         Mnemonic::Shl
@@ -227,7 +228,11 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Shr
         | Mnemonic::Sar
         | Mnemonic::Rol
-        | Mnemonic::Ror => shift_is_lowerable(instr),
+        | Mnemonic::Ror
+        | Mnemonic::Rcl
+        | Mnemonic::Rcr => shift_is_lowerable(instr),
+        // Bit test operations: same operand forms as ALU (reg/mem, reg/imm).
+        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr => alu_is_lowerable(instr),
         Mnemonic::Cmove
         | Mnemonic::Cmovne
         | Mnemonic::Cmova
