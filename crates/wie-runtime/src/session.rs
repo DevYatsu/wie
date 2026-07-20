@@ -1460,8 +1460,8 @@ impl RuntimeSession {
                             .context("ExitProcess code does not fit u32")?;
                         events.push(EntryTraceEvent {
                             index,
-                            library: resolved.library.clone(),
-                            name: resolved.name.clone(),
+                            library: resolved.library.clone().into(),
+                            name: resolved.name.clone().into(),
                             fake_target_va: hook.address,
                             handled: true,
                             return_value: None,
@@ -1579,8 +1579,8 @@ impl RuntimeSession {
                                     charged_api = charged_api.saturating_add(1);
                                     events.push(EntryTraceEvent {
                                         index,
-                                        library: resolved.library.clone(),
-                                        name: resolved.name.clone(),
+                                        library: resolved.library.clone().into(),
+                                        name: resolved.name.clone().into(),
                                         fake_target_va: hook.address,
                                         handled: true,
                                         return_value: Some(handler_result.return_value),
@@ -1631,8 +1631,8 @@ impl RuntimeSession {
                                             request,
                                         },
                                     ) => {
-                                        let outer_library = resolved.library.clone();
-                                        let outer_name = resolved.name.clone();
+                                        let outer_library: Arc<str> = resolved.library.clone().into();
+                                        let outer_name: Arc<str> = resolved.name.clone().into();
                                         let request = *request;
                                         charged_api = charged_api.saturating_add(1);
                                         events.push(EntryTraceEvent {
@@ -1678,8 +1678,8 @@ impl RuntimeSession {
                                         );
                                         events.push(EntryTraceEvent {
                                             index,
-                                            library: resolved.library.clone(),
-                                            name: resolved.name.clone(),
+                                            library: resolved.library.clone().into(),
+                                            name: resolved.name.clone().into(),
                                             fake_target_va: hook.address,
                                             handled: false,
                                             return_value: None,

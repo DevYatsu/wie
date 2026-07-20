@@ -1,38 +1,13 @@
 //! Fake API registration and dense VA decode for the runtime hook range.
 
 use anyhow::Result;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use wie_winapi::{
-    FakeVa, WinApiId, WinApiTraits, WINAPI_NAME_ROWS, decode_fake_va, encode_export,
-    encode_unresolved, resolve_winapi_id,
+    FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export, encode_unresolved,
+    resolve_winapi_id, winapi_id_export,
 };
-
-/// Pre-computed `(library, name)` as [`Arc<str>`] for every [`WinApiId`].
-///
-/// Built once on first access from the static [`WINAPI_NAME_ROWS`] table.
-/// The Export/Alias path in [`resolve_fake_api_at`] clones from this cache
-/// instead of calling `Arc::<str>::from(lib)` on every API stop — replaces a
-/// heap allocation + string copy with an atomic increment.
-///
-/// The table is sized to [`WINAPI_ID_COUNT`] with unused slots filled with the
-/// fallback `("unknown.dll", "unknown")`.  WinApiId values that appear in the
-/// static row table get their real library/name; all others get the fallback.
-static EXPORT_NAME_CACHE: LazyLock<Vec<(Arc<str>, Arc<str>)>> = LazyLock::new(|| {
-    let cap = wie_winapi::WINAPI_ID_COUNT;
-    let mut table = vec![
-        (Arc::from("unknown.dll"), Arc::from("unknown"));
-        cap
-    ];
-    for &(lib, name, id) in WINAPI_NAME_ROWS {
-        let idx = id.to_u16() as usize;
-        if idx < cap {
-            table[idx] = (Arc::from(lib), Arc::from(name));
-        }
-    }
-    table
-});
 
 /// Runtime fake API dispatch entry (IAT soft slots + trace metadata).
 #[derive(Debug, Clone)]
@@ -104,10 +79,15 @@ impl SoftApiTable {
 }
 
 /// Resolved stop target after bit-decode (no HashMap).
+///
+/// `library` and `name` use [`Cow<'static, str>`] so the Export/Alias path can
+/// borrow the static string slices returned by [`winapi_id_export`] — zero
+/// allocation on the hot path, no ref-counting.  The Unresolved/COM paths that
+/// need owned strings allocate only once, at resolution time.
 #[derive(Debug, Clone)]
 pub struct ResolvedFakeApi {
-    pub library: Arc<str>,
-    pub name: Arc<str>,
+    pub library: Cow<'static, str>,
+    pub name: Cow<'static, str>,
     pub winapi_id: Option<WinApiId>,
     pub traits: WinApiTraits,
 }
@@ -171,6 +151,10 @@ pub fn resolve_import_fake_va(
 /// Traits (guest_stub, noisy, exit_process, …) are pre-computed by `make_entry`
 /// and embedded in `WinApiId::traits()` for Export entries — no need to
 /// re-classify guest stubs on the hot path.
+///
+/// `library` and `name` borrow from [`winapi_id_export`]'s static strings for
+/// the Export/Alias path — zero allocation on every stop.  The Unresolved path
+/// converts the soft-table `Arc<str>` to an owned `String` (far less common).
 pub(crate) fn resolve_fake_api_at(
     address: u64,
     soft: &SoftApiTable,
@@ -179,11 +163,10 @@ pub(crate) fn resolve_fake_api_at(
     let _ = address; // available for future trace correlation
     match decoded {
         FakeVa::Export(id) | FakeVa::Alias(id) => {
-            let idx = id.to_u16() as usize;
-            let (lib, name) = &EXPORT_NAME_CACHE[idx];
+            let (lib, name) = winapi_id_export(id).unwrap_or(("unknown.dll", "unknown"));
             Some(ResolvedFakeApi {
-                library: lib.clone(),
-                name: name.clone(),
+                library: Cow::Borrowed(lib),
+                name: Cow::Borrowed(name),
                 winapi_id: Some(id),
                 traits: id.traits(),
             })
@@ -191,8 +174,8 @@ pub(crate) fn resolve_fake_api_at(
         FakeVa::Unresolved(index) => {
             let e = soft.get(index)?;
             Some(ResolvedFakeApi {
-                library: e.library.clone(),
-                name: e.name.clone(),
+                library: Cow::Owned(e.library.to_string()),
+                name: Cow::Owned(e.name.to_string()),
                 winapi_id: e.winapi_id,
                 traits: e.traits,
             })
@@ -223,8 +206,8 @@ fn resolve_com(iface: u8, method: u8) -> Option<ResolvedFakeApi> {
     let winapi_id = resolve_winapi_id(library, &name);
     let traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
     Some(ResolvedFakeApi {
-        library: Arc::<str>::from(library),
-        name: Arc::<str>::from(name),
+        library: Cow::Borrowed(library),
+        name: Cow::Owned(name),
         winapi_id,
         traits,
     })

@@ -340,10 +340,7 @@ impl WinApiId {
 }
 
 /// Static (library, name, id) rows for one-time resolution.
-///
-/// Public so [`crate::hooks::EXPORT_NAME_CACHE`] can pre-compute
-/// `Arc<str>` pairs without iterating the full discriminant range.
-pub static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
+static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
     (
         "kernel32.dll",
         "getversionexa",
