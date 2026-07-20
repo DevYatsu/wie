@@ -1256,78 +1256,12 @@ impl RuntimeSession {
                 if matches!(quantum, Quantum::Break) {
                     // already set break_term
                 } else if invalid_memory.hit {
-                    let rip = engine.read_rip().context("rip after invalid mem")?;
-                    let rsp = engine.read_rsp().context("rsp after invalid mem")?;
-                    let rax = engine.read_rax().context("rax after invalid mem")?;
-                    let rcx = engine.read_rcx().context("rcx after invalid mem")?;
-                    let rdx = engine.read_rdx().context("rdx after invalid mem")?;
-                    let r8 = engine.read_r8().context("r8 after invalid mem")?;
-                    let r9 = engine.read_r9().context("r9 after invalid mem")?;
-                    // Stack slots (return addr + shadow) and *this / vtable for null-call diagnosis.
-                    let mut stack_slots = String::new();
-                    for i in 0_u64..32 {
-                        let mut b = [0_u8; 8];
-                        let off = i.wrapping_mul(8);
-                        let va = rsp.wrapping_add(off);
-                        match engine.mem_read(va, &mut b) {
-                            Ok(()) => {
-                                let v = u64::from_le_bytes(b);
-                                stack_slots.push_str(&format!(" [rsp+{off:#x}]={v:#x}"));
-                            }
-                            Err(_) => stack_slots.push_str(&format!(" [rsp+{off:#x}]=?")),
-                        }
-                    }
-                    let mut this_info = String::new();
-                    if rcx != 0 {
-                        let mut b = [0_u8; 8];
-                        if engine.mem_read(rcx, &mut b).is_ok() {
-                            let vtbl = u64::from_le_bytes(b);
-                            this_info.push_str(&format!(" [rcx]={vtbl:#x}"));
-                            // Dump object body (stack COM objects often ~0x40–0x80 bytes).
-                            for i in 0_u64..12 {
-                                let mut e = [0_u8; 8];
-                                let ova = rcx.wrapping_add(i.wrapping_mul(8));
-                                if engine.mem_read(ova, &mut e).is_ok() {
-                                    this_info.push_str(&format!(
-                                        " obj[{i}]={:#x}",
-                                        u64::from_le_bytes(e)
-                                    ));
-                                }
-                            }
-                            if vtbl > 0x10000 {
-                                for i in 0_u64..8 {
-                                    let mut e = [0_u8; 8];
-                                    let eva = vtbl.wrapping_add(i.wrapping_mul(8));
-                                    if engine.mem_read(eva, &mut e).is_ok() {
-                                        this_info.push_str(&format!(
-                                            " vtbl[{i}]={:#x}",
-                                            u64::from_le_bytes(e)
-                                        ));
-                                    }
-                                }
-                            }
-                        } else {
-                            this_info.push_str(" [rcx]=unmapped");
-                        }
-                    }
-                    break_term = Some(EntryTraceTermination::RuntimeStop(format!(
-                        "invalid memory access before fake API hook: \
-                         type={} address={:#018x} size={} value={} \
-                         rip={rip:#018x}; rsp={rsp:#018x}; rax={rax:#018x}; \
-                         rcx={rcx:#018x}; rdx={rdx:#018x}; \
-                         r8={r8:#018x}; r9={r9:#018x};{stack_slots};{this_info}",
-                        invalid_memory.access_type,
-                        invalid_memory.address,
-                        invalid_memory.size,
-                        invalid_memory.value,
-                    )));
+                    break_term = Some(invalid_memory_diagnostic(
+                        engine,
+                        &invalid_memory,
+                    )?);
                     quantum = Quantum::Break;
                 } else if !hook.hit {
-                    let rip = engine.read_rip().context("rip after no-hook")?;
-                    let rsp = engine.read_rsp().context("rsp after no-hook")?;
-                    let rax = engine.read_rax().context("rax after no-hook")?;
-                    let rcx = engine.read_rcx().context("rcx after no-hook")?;
-                    let rdx = engine.read_rdx().context("rdx after no-hook")?;
                     self.no_hook_slices = self
                         .no_hook_slices
                         .checked_add(1)
@@ -1336,6 +1270,11 @@ impl RuntimeSession {
                         || self.no_hook_slices.is_multiple_of(5)
                         || self.no_hook_slices == no_hook_limit
                     {
+                        let rip = engine.read_rip().context("rip after no-hook")?;
+                        let rsp = engine.read_rsp().context("rsp after no-hook")?;
+                        let rax = engine.read_rax().context("rax after no-hook")?;
+                        let rcx = engine.read_rcx().context("rcx after no-hook")?;
+                        let rdx = engine.read_rdx().context("rdx after no-hook")?;
                         tracing::debug!(
                             slice = self.no_hook_slices,
                             limit = no_hook_limit,
@@ -1349,6 +1288,11 @@ impl RuntimeSession {
                         );
                     }
                     if self.no_hook_slices >= no_hook_limit {
+                        let rip = engine.read_rip().context("rip after no-hook")?;
+                        let rsp = engine.read_rsp().context("rsp after no-hook")?;
+                        let rax = engine.read_rax().context("rax after no-hook")?;
+                        let rcx = engine.read_rcx().context("rcx after no-hook")?;
+                        let rdx = engine.read_rdx().context("rdx after no-hook")?;
                         break_term = Some(EntryTraceTermination::RuntimeStop(format!(
                             "emulation stopped without hitting fake API hook after {} slices: \
                              begin={begin:#018x}; rip={rip:#018x}; rsp={rsp:#018x}; \
@@ -2014,6 +1958,78 @@ struct GuestCallbackCompletion {
     outer_fake_va: u64,
     return_value: u64,
     return_address: u64,
+}
+
+/// [`Cold`] diagnostic for invalid memory access — 32 stack slot reads + object
+/// dump + vtable dump.  Kept out of line so the normal `run_until_stop` hot path
+/// does not pay the I-cache cost of this heavyweight crash instrumentation.
+#[cold]
+fn invalid_memory_diagnostic(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    access: &wie_cpu::InvalidMemoryAccess,
+) -> Result<EntryTraceTermination> {
+    let rip = engine.read_rip()?;
+    let rsp = engine.read_rsp()?;
+    let rax = engine.read_rax()?;
+    let rcx = engine.read_rcx()?;
+    let rdx = engine.read_rdx()?;
+    let r8 = engine.read_r8()?;
+    let r9 = engine.read_r9()?;
+
+    // Stack slots (return addr + shadow) and *this / vtable for null-call diagnosis.
+    let mut stack_slots = String::new();
+    for i in 0_u64..32 {
+        let mut b = [0_u8; 8];
+        let off = i.wrapping_mul(8);
+        let va = rsp.wrapping_add(off);
+        match engine.mem_read(va, &mut b) {
+            Ok(()) => {
+                let v = u64::from_le_bytes(b);
+                stack_slots.push_str(&format!(" [rsp+{off:#x}]={v:#x}"));
+            }
+            Err(_) => stack_slots.push_str(&format!(" [rsp+{off:#x}]=?")),
+        }
+    }
+
+    let mut this_info = String::new();
+    if rcx != 0 {
+        let mut b = [0_u8; 8];
+        if engine.mem_read(rcx, &mut b).is_ok() {
+            let vtbl = u64::from_le_bytes(b);
+            this_info.push_str(&format!(" [rcx]={vtbl:#x}"));
+            // Dump object body (stack COM objects often ~0x40–0x80 bytes).
+            for i in 0_u64..12 {
+                let mut e = [0_u8; 8];
+                let ova = rcx.wrapping_add(i.wrapping_mul(8));
+                if engine.mem_read(ova, &mut e).is_ok() {
+                    this_info.push_str(&format!(" obj[{i}]={:#x}", u64::from_le_bytes(e)));
+                }
+            }
+            if vtbl > 0x10000 {
+                for i in 0_u64..8 {
+                    let mut e = [0_u8; 8];
+                    let eva = vtbl.wrapping_add(i.wrapping_mul(8));
+                    if engine.mem_read(eva, &mut e).is_ok() {
+                        this_info.push_str(&format!(" vtbl[{i}]={:#x}", u64::from_le_bytes(e)));
+                    }
+                }
+            }
+        } else {
+            this_info.push_str(" [rcx]=unmapped");
+        }
+    }
+
+    Ok(EntryTraceTermination::RuntimeStop(format!(
+        "invalid memory access before fake API hook: \
+         type={} address={:#018x} size={} value={} \
+         rip={rip:#018x}; rsp={rsp:#018x}; rax={rax:#018x}; \
+         rcx={rcx:#018x}; rdx={rdx:#018x}; \
+         r8={r8:#018x}; r9={r9:#018x};{stack_slots};{this_info}",
+        access.access_type,
+        access.address,
+        access.size,
+        access.value,
+    )))
 }
 
 /// Append one journal line when `WIE_API_JOURNAL` is set (backend A/B diffs).
